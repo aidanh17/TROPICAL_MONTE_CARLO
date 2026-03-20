@@ -1821,10 +1821,12 @@ Module[
 
   If[workDir === Automatic,
     workDir = DirectoryName[$InputFileName];
-    If[workDir === "",
+    If[workDir === "" || !StringQ[workDir],
       workDir = Directory[]
-    ]
+    ];
+    workDir = FileNameJoin[{workDir, "INTERFILES"}]
   ];
+  If[!DirectoryQ[workDir], Quiet[CreateDirectory[workDir]]];
 
   {dualVertices, simplexList} = fanData;
   n      = Length[integrandSpec["Variables"]];

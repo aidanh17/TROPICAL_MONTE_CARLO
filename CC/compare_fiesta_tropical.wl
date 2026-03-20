@@ -197,7 +197,7 @@ Print["================================================================"];
 Print[];
 
 (* Load tropical MC *)
-SetDirectory["/home/aidanh/Desktop/Tropical_Monte_Carlo_Final/Bubble1final/tropical_code_claudef"];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 Get[FileNameJoin[{Directory[], "tropical_eval.wl"}]];
 
 Print["Tropical MC package loaded."];
@@ -500,7 +500,7 @@ Module[{exactPole, exactFinite, fiestaResult, tropicalNI, eps0},
   Print["  FIESTA result:  ", fiestaResult];
 
   (* Tropical MC: validate sector decomposition at multiple eps values *)
-  SetDirectory["/home/aidanh/Desktop/Tropical_Monte_Carlo_Final/Bubble1final/tropical_code_claudef"];
+  SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 
   Print[];
   Print["  NIntegrate verification at several eps:"];

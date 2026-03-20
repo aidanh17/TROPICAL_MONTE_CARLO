@@ -5,14 +5,14 @@
    Requires: Polymake installed and accessible.
 
    Load the package first:
-     SetDirectory[NotebookDirectory[]];   (* or wherever tropical_fan.wl lives *)
+     SetDirectory[FileNameJoin[{NotebookDirectory[], ".."}]];
      << tropical_fan`
    ============================================================================ *)
 
 (* --- Load package --- *)
 (* If running from a notebook, use: SetDirectory[NotebookDirectory[]] first *)
 (* If running as a script, use the full path below *)
-Get[FileNameJoin[{DirectoryName[$InputFileName], "tropical_fan.wl"}]];
+Get[FileNameJoin[{DirectoryName[$InputFileName], "..", "tropical_fan.wl"}]];
 
 (* Optional: set polymake path if not auto-detected *)
 (* $TropicalFanPolymakePath = "/opt/homebrew/bin/polymake"; *)

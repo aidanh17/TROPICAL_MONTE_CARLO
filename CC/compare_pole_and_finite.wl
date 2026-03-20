@@ -55,7 +55,7 @@ Module[{result},
 Print[];
 
 (* --- Tropical MC --- *)
-SetDirectory["/home/aidanh/Desktop/Tropical_Monte_Carlo_Final/Bubble1final/tropical_code_claudef"];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 Get[FileNameJoin[{Directory[], "tropical_eval.wl"}]];
 
 Module[{poly, vars, spec, verts, fanData, vr},
@@ -111,7 +111,7 @@ Module[{result},
 Print[];
 
 (* --- Tropical MC: full sector decomposition + subtraction --- *)
-SetDirectory["/home/aidanh/Desktop/Tropical_Monte_Carlo_Final/Bubble1final/tropical_code_claudef"];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 
 Module[{poly, vars, eps, spec, verts, fanData,
         dualVertices, simplexList,
@@ -412,7 +412,7 @@ Module[{result},
 Print[];
 
 (* --- Tropical MC --- *)
-SetDirectory["/home/aidanh/Desktop/Tropical_Monte_Carlo_Final/Bubble1final/tropical_code_claudef"];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 
 Module[{poly, vars, eps, spec, verts, fanData,
         dualVertices, simplexList,

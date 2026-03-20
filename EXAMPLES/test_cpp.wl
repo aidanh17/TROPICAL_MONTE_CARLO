@@ -1,7 +1,7 @@
 (* Test C++ compilation and MC execution on Linux *)
 (* Based on Example 6: C++ code generation *)
 
-SetDirectory[DirectoryName[$InputFileName]];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 Get[FileNameJoin[{Directory[], "tropical_eval.wl"}]];
 
 Print["=== Test: C++ code generation and execution ==="];
@@ -37,8 +37,9 @@ Module[{poly, vars, spec, verts, fanData, dualVerts, simplices,
   allSectorData = Select[allSectorData, AssociationQ];
 
   (* Generate C++ *)
-  cppFile = FileNameJoin[{Directory[], "test_mc_generated.cpp"}];
-  binary  = FileNameJoin[{Directory[], "test_mc"}];
+  Quiet[CreateDirectory[FileNameJoin[{Directory[], "INTERFILES"}]]];
+  cppFile = FileNameJoin[{Directory[], "INTERFILES", "test_mc_generated.cpp"}];
+  binary  = FileNameJoin[{Directory[], "INTERFILES", "test_mc"}];
 
   cppResult = GenerateCppMonteCarlo[
     allSectorData, {},
@@ -53,8 +54,8 @@ Module[{poly, vars, spec, verts, fanData, dualVerts, simplices,
     Print["Compilation successful!"];
 
     (* Write dummy kinematic data (no params, just need one line) *)
-    kinFile = FileNameJoin[{Directory[], "test_kin_data.txt"}];
-    resultFile = FileNameJoin[{Directory[], "test_mc_results.txt"}];
+    kinFile = FileNameJoin[{Directory[], "INTERFILES", "test_kin_data.txt"}];
+    resultFile = FileNameJoin[{Directory[], "INTERFILES", "test_mc_results.txt"}];
     Export[kinFile, "0\n", "Text"];
 
     (* Run *)

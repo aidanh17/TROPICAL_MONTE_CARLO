@@ -1,13 +1,13 @@
 (* Run only the 1/epsilon divergent pipeline tests: Tests 3, 4, 8-18 *)
 
-SetDirectory[DirectoryName[$InputFileName]];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 Get[FileNameJoin[{Directory[], "tropical_eval.wl"}]];
 
 Print["Package loaded."];
 Print[];
 
 (* Load the example file to get the test functions *)
-Get[FileNameJoin[{Directory[], "tropical_eval_examples.wl"}]];
+Get[FileNameJoin[{Directory[], "EXAMPLES", "tropical_eval_examples.wl"}]];
 
 Print[];
 Print["================================================================"];

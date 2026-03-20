@@ -1,7 +1,7 @@
 (* Quick test: just Example 1 from tropical_eval_examples.wl *)
 (* Verifies: package loading, Polymake fan computation, ProcessSector, ValidateDecomposition *)
 
-SetDirectory[DirectoryName[$InputFileName]];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 Get[FileNameJoin[{Directory[], "tropical_eval.wl"}]];
 
 Print["tropical_eval.wl loaded successfully"];

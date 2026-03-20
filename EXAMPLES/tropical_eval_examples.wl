@@ -5,15 +5,15 @@
    Requires: tropical_fan.wl, tropical_eval.wl, Polymake, g++ with OpenMP.
 
    Load the package first:
-     SetDirectory[NotebookDirectory[]];
+     SetDirectory[FileNameJoin[{NotebookDirectory[], ".."}]];
      Get["tropical_eval.wl"];
 
    Or run as a script:
-     wolframscript -file tropical_eval_examples.wl
+     wolframscript -file EXAMPLES/tropical_eval_examples.wl
    ============================================================================ *)
 
 (* --- Load package --- *)
-SetDirectory[DirectoryName[$InputFileName]];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 Get[FileNameJoin[{Directory[], "tropical_eval.wl"}]];
 
 Print["tropical_eval.wl loaded successfully"];
@@ -365,7 +365,8 @@ Module[{poly, vars, spec, verts, fanData, allSectors,
   Print["Processed ", Length[convergent], " convergent sectors"];
 
   (* Generate C++ *)
-  cppFile = FileNameJoin[{Directory[], "example6_mc.cpp"}];
+  Quiet[CreateDirectory[FileNameJoin[{Directory[], "INTERFILES"}]]];
+  cppFile = FileNameJoin[{Directory[], "INTERFILES", "example6_mc.cpp"}];
   cppResult = GenerateCppMonteCarlo[
     convergent, {},   (* no divergent sectors *)
     spec, cppFile,
@@ -377,9 +378,9 @@ Module[{poly, vars, spec, verts, fanData, allSectors,
 
     (* Compile *)
     Module[{binary, kinFile, resultFile, runResult},
-      binary     = FileNameJoin[{Directory[], "example6_mc"}];
-      kinFile    = FileNameJoin[{Directory[], "example6_kin.txt"}];
-      resultFile = FileNameJoin[{Directory[], "example6_results.txt"}];
+      binary     = FileNameJoin[{Directory[], "INTERFILES", "example6_mc"}];
+      kinFile    = FileNameJoin[{Directory[], "INTERFILES", "example6_kin.txt"}];
+      resultFile = FileNameJoin[{Directory[], "INTERFILES", "example6_results.txt"}];
 
       (* No kinematics: write count = 1 *)
       Export[kinFile, "1\n", "Text"];
@@ -458,7 +459,8 @@ Module[{lam, poly, vars, spec, verts, fanData, allSectors,
   convergent = Select[allSectors,
     AssociationQ[#] && !#["IsDivergent"] &];
 
-  cppFile = FileNameJoin[{Directory[], "example7_mc.cpp"}];
+  Quiet[CreateDirectory[FileNameJoin[{Directory[], "INTERFILES"}]]];
+  cppFile = FileNameJoin[{Directory[], "INTERFILES", "example7_mc.cpp"}];
   cppResult = GenerateCppMonteCarlo[
     convergent, {}, spec, cppFile,
     "NSamples" -> 200000
@@ -466,9 +468,9 @@ Module[{lam, poly, vars, spec, verts, fanData, allSectors,
 
   If[AssociationQ[cppResult],
     Module[{binary, kinFile, resultFile, runResult},
-      binary     = FileNameJoin[{Directory[], "example7_mc"}];
-      kinFile    = FileNameJoin[{Directory[], "example7_kin.txt"}];
-      resultFile = FileNameJoin[{Directory[], "example7_results.txt"}];
+      binary     = FileNameJoin[{Directory[], "INTERFILES", "example7_mc"}];
+      kinFile    = FileNameJoin[{Directory[], "INTERFILES", "example7_kin.txt"}];
+      resultFile = FileNameJoin[{Directory[], "INTERFILES", "example7_results.txt"}];
 
       (* Write kinematic data: one lam value per line *)
       Export[kinFile,
@@ -2122,8 +2124,9 @@ RunTest13[] := Module[
   processedDiv = Select[processedDiv, AssociationQ];
 
   (* Substitute eps for numerical codegen *)
-  cppFile   = FileNameJoin[{$TemporaryDirectory, "test13_tropical.cpp"}];
-  cppBinary = FileNameJoin[{$TemporaryDirectory, "test13_tropical"}];
+  Quiet[CreateDirectory[FileNameJoin[{Directory[], "INTERFILES"}]]];
+  cppFile   = FileNameJoin[{Directory[], "INTERFILES", "test13_tropical.cpp"}];
+  cppBinary = FileNameJoin[{Directory[], "INTERFILES", "test13_tropical"}];
 
   Module[{convNum, specNum},
     convNum = convergentSectors /. eps -> testEps;

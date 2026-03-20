@@ -16,7 +16,7 @@ where t₀ = 1-∑tᵢ, D is the homogeneity degree of the integrand, and Δ
 is the simplex. This allows direct numerical comparison of both the
 1/ε pole and the ε⁰ finite part.
 
-Scripts are in: tropical_code_claudef/FIESTA_Compare/
+Scripts are in: TROPICAL_MONTE_CARLO/CC/
 
 
 ================================================================================

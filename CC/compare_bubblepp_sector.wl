@@ -23,7 +23,7 @@ baseDir = "/home/aidanh/Desktop/Tropical_Monte_Carlo_Final/Bubble1final";
 SetDirectory[baseDir];
 Get[FileNameJoin[{baseDir, "bispectrum_config.wl"}]];
 Get[FileNameJoin[{baseDir, "bispectrum_utils.wl"}]];
-Get[FileNameJoin[{baseDir, "tropical_code_claudef", "tropical_eval.wl"}]];
+Get[FileNameJoin[{DirectoryName[$InputFileName], "..", "tropical_eval.wl"}]];
 
 Print["mu = ", $BispectrumMu, "  delp = ", $BispectrumDelp, "  delm = ", $BispectrumDelm];
 Print[];

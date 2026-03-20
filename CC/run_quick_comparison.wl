@@ -83,7 +83,7 @@ Print[];
    TROPICAL MC TESTS
    ============================================================================ *)
 
-SetDirectory["/home/aidanh/Desktop/Tropical_Monte_Carlo_Final/Bubble1final/tropical_code_claudef"];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 Get[FileNameJoin[{Directory[], "tropical_eval.wl"}]];
 Print["Tropical MC loaded."];
 Print[];

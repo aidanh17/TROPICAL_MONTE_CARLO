@@ -166,7 +166,7 @@ Print["  PART 2: Tropical MC Results"];
 Print["================================================================"];
 Print[];
 
-SetDirectory["/home/aidanh/Desktop/Tropical_Monte_Carlo_Final/Bubble1final/tropical_code_claudef"];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 Get[FileNameJoin[{Directory[], "tropical_eval.wl"}]];
 Print["Tropical MC package loaded."];
 Print[];
@@ -485,7 +485,7 @@ Module[{fiestaResult},
 Print[];
 
 (* Tropical MC version: same polynomial, no delta, over [0,inf] *)
-SetDirectory["/home/aidanh/Desktop/Tropical_Monte_Carlo_Final/Bubble1final/tropical_code_claudef"];
+SetDirectory[FileNameJoin[{DirectoryName[$InputFileName], ".."}]];
 
 Print["Tropical MC: Int_0^inf dx1 dx2 x1^{2eps-1} P^{-2}"];
 Print["  = Int_0^inf x^{2eps-1}/(1+x)^2 dx * 1  (factored)"];

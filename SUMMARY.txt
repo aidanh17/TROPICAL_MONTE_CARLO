@@ -451,13 +451,38 @@ DivergentSectorData (Association, returned by ProcessDivergentSector):
 5.  FILES
 ================================================================================
 
-tropical_fan.wl            Tropical fan computation via Polymake (dependency)
-tropical_eval.wl           Main evaluation package (this code)
-tropical_eval_examples.wl  14 worked examples + 18-test validation suite
-tropical_fan_examples.wl   Examples for the fan package
+Core packages (TROPICAL_MONTE_CARLO/):
+  tropical_fan.wl                    Tropical fan computation via Polymake
+  tropical_eval.wl                   Main evaluation package
+
+Examples and tests (TROPICAL_MONTE_CARLO/EXAMPLES/):
+  tropical_eval_examples.wl          14 worked examples + 18-test validation suite
+  tropical_fan_examples.wl           Examples for the fan package
+  test_quick.wl                      Quick test (Example 1 only)
+  test_cpp.wl                        C++ compilation and MC execution test
+  test_divergent.wl                  Divergent pipeline tests (Tests 3,4,8-18)
+  prompt_tropical_mc.txt             Development prompt / specification
+
+Generated intermediate files (TROPICAL_MONTE_CARLO/INTERFILES/):
+  (auto-created, gitignored)         Generated C++ source, compiled binaries,
+                                     kinematic data files, MC result files
+
+Cross-checks against FIESTA (TROPICAL_MONTE_CARLO/CC/):
+  SUMMARY.txt                        Cross-check results summary
+  compare_pole_and_finite.wl         GL(1)-converted comparison (tests 1-3)
+  fiesta_bubblepp_standalone.wl      FIESTA on bubblepp presector 1
+  compare_bubblepp_sector.wl         Tropical MC on bubblepp presector 1
+  convergence_study_v2.wl            MC convergence study (50K-10M samples)
+  diagnose_eps_eps.wl                eps/eps cross-term investigation
+  compare_fiesta_tropical.wl         Full FIESTA vs tropical comparison
+  compare_v2.wl                      Comparison script v2
+  run_quick_comparison.wl            Quick comparison runner
+  convergence_study.wl               Convergence study v1
+  paper_v2.tex                       Mizera paper on GL(1) gauge fixing
+  FIESTA5.tex                        FIESTA5 documentation
 
 
-6.  EXAMPLES  (tropical_eval_examples.wl)
+6.  EXAMPLES  (EXAMPLES/tropical_eval_examples.wl)
 ================================================================================
 
 Example 1:  Basic 2D convergent integral
@@ -606,4 +631,4 @@ Kinematic scan (one compile, many evaluations):
 
 Command line:
 
-    /Applications/Mathematica.app/Contents/MacOS/WolframKernel -script tropical_eval_examples.wl
+    wolframscript -file EXAMPLES/tropical_eval_examples.wl

@@ -17,7 +17,7 @@
 baseDir = "/home/aidanh/Desktop/Tropical_Monte_Carlo_Final/Bubble1final";
 SetDirectory[baseDir];
 Get[FileNameJoin[{baseDir, "bispectrum_config.wl"}]];
-Get[FileNameJoin[{baseDir, "tropical_code_claudef", "tropical_eval.wl"}]];
+Get[FileNameJoin[{DirectoryName[$InputFileName], "..", "tropical_eval.wl"}]];
 
 exportData = Get[FileNameJoin[{baseDir, "bubblepp", "presector_integrands_bubblepp.m"}]];
 sd1 = exportData["SectorIntegrands"][[1]];
