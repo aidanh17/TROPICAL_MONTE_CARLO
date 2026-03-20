@@ -1,0 +1,609 @@
+================================================================================
+  TROPICAL MONTE CARLO EVALUATION PIPELINE
+  Summary of tropical_eval.wl
+================================================================================
+
+
+1.  THE PROBLEM
+================================================================================
+
+We want to numerically evaluate generalized Euler integrals of the form
+
+    I = Integral_{[0,inf)^n} dx_1 ... dx_n  prod_i x_i^{A_i}  prod_j P_j(x)^{B_j}
+
+where P_j are polynomials in x_1,...,x_n with real (possibly kinematic-dependent)
+coefficients, A_i are monomial exponents, and B_j are polynomial exponents
+(typically negative, e.g. B_j = -2).  The exponents may depend on a regulator
+eps for dimensional regularization.
+
+The challenge is that the integrand can be singular near coordinate
+hyperplanes, can have wildly varying magnitude, and must be evaluated at
+many kinematic points.  Direct adaptive quadrature scales poorly in
+dimension and kinematic count.
+
+
+2.  THE STRATEGY: TROPICAL DECOMPOSITION + FLATTENING + MONTE CARLO
+================================================================================
+
+The pipeline has four conceptual stages:
+
+    (a) Tropical fan  -->  (b) Sector processing  -->  (c) C++ generation  -->  (d) MC execution
+
+Each stage is described below.
+
+
+2a.  TROPICAL FAN DECOMPOSITION  (tropical_fan.wl)
+--------------------------------------------------------------------------------
+
+Input:  The Newton polytope of the product P_1 * P_2 * ... * P_m
+Output: A simplicial fan partitioning the positive orthant in R^n
+
+The key idea from tropical geometry: the integrand's behavior as x -> 0 along
+different directions is controlled by which monomial of the polynomial dominates.
+The tropical (or normal) fan of the Newton polytope partitions R^n into
+simplicial cones, one for each "region of dominance."
+
+Computing the fan:  The fan is determined by the Newton polytope of the product
+of all polynomials in the integrand.  Crucially:
+
+  - The fan depends only on which monomials are present (the support), not on
+    their coefficients or on the exponents B_j.
+  - The normal fan of a Minkowski sum a*Newt(P1) + b*Newt(P2) is the common
+    refinement of the individual normal fans, and this refinement is the same
+    for ANY positive a, b.
+  - Therefore, to compute the fan, simply pass the product P_1 * P_2 * ... * P_m
+    (each to the first power) to PolytopeVertices.  No powers are needed.
+  - For integrands with kinematic-dependent coefficients (e.g. P = 1 + lam*x1^2),
+    use a unit-coefficient proxy (e.g. 1 + x1^2) since the fan is independent
+    of coefficient values.
+
+In code:
+    fanPoly = P1 * P2 * ... * Pm;
+    verts   = PolytopeVertices[fanPoly^(-1), vars];
+    fanData = ComputeDecomposition[verts];
+
+The package tropical_fan.wl computes this via Polymake.  It returns:
+  - dualVertices:  a list of ray vectors (rows), each a direction in R^n
+  - simplexList:   a list of simplices, each a list of indices into dualVertices
+
+Each simplex defines one sector (simplicial cone) of the decomposition.  Since
+the fan covers all of R^n, the sum over sectors reconstructs the original integral.
+
+
+2b.  SECTOR PROCESSING  (Module 1: ProcessSector)
+--------------------------------------------------------------------------------
+
+For each sector (simplicial cone with rays rho_1,...,rho_n), we perform:
+
+Step 1: Monomial change of variables.
+
+    x_i = prod_j  y_j^{M_{ij}}     where  M = -Transpose[{rho_1,...,rho_n}]
+
+    This maps [0,inf)^n -> [0,1)^n (after further flattening) and aligns the
+    cone with coordinate axes.  The Jacobian contributes:
+
+        dx_1...dx_n = |det(M)| * prod_j y_j^{sum_i M_{ij} - 1} dy_1...dy_n
+
+    Combined with the original monomial prefactor x_i^{A_i}, the new monomial
+    prefactor is:
+
+        prod_j y_j^{rawA_j - 1}    where  rawA = (A + 1) . M
+
+Step 2: Tropical factoring.
+
+    After substitution, each polynomial P_k becomes a sum of monomials in y with
+    SIGNED exponents.  The tropically dominant monomial (the one the fan says
+    dominates in this cone) has the minimum exponents:
+
+        d_{k,i} = min_m (exponent of y_i in monomial m of P_k)
+
+    We factor it out:
+
+        P_k(y) = prod_i y_i^{d_{k,i}}  *  Q_k(y)
+
+    The "cleared" polynomial Q_k has all non-negative y-exponents and includes
+    a constant term (the dominant monomial itself).  The factored-out y-powers
+    merge into the monomial prefactor, giving effective exponents:
+
+        a_i^eff = rawA_i + sum_k B_k * d_{k,i}
+
+    IMPORTANT: The tropical factoring uses only exponent vectors, not
+    coefficients.  This is correct because the fan structure is determined by
+    tropicalization (which ignores coefficients).  With large coefficients, the
+    tropically dominant monomial may not be the numerically largest one, but
+    the factoring is an exact algebraic identity -- correctness is unaffected,
+    only MC variance changes.
+
+    For a properly constructed tropical fan and convergent integral,
+    Re(a_i^eff) > 0 for all i, guaranteeing integrability.
+
+Step 3: Flattening substitution.
+
+    y_i = (y'_i)^{1/a_i^eff}
+
+    This absorbs the monomial prefactor entirely:
+
+        y_i^{a_i^eff - 1} dy_i  =  (1/a_i^eff) dy'_i
+
+    After flattening:
+    - Integration domain is [0,1]^n
+    - NO monomial prefactor remains (it's exactly 1)
+    - The prefactor becomes |det(M)| / prod(a_i^eff)
+    - Each monomial {coeff, {e_1,...,e_n}} of Q_k becomes {coeff, {e_1/a_1,...,e_n/a_n}}
+    - The integrand is bounded on [0,1]^n and O(1) -- ideal for uniform MC
+
+The sector integral becomes:
+
+    I_sector = prefactor * Integral_{[0,1]^n} dy'  prod_j Q_j(y')^{B_j}
+
+
+2c.  DIVERGENCE REGULATION  (Module 2: ProcessDivergentSector)
+--------------------------------------------------------------------------------
+
+When the integral depends on a regulator eps, some sectors may have
+Re(a_k^eff) -> 0 as eps -> 0.  This creates a 1/eps pole.
+
+Specifically, if a_k(eps) = c_k * eps + O(eps^2) with c_k > 0, then
+
+    Integral_0^1 y_k^{a_k - 1} dy_k  =  1/a_k  =  1/(c_k * eps) + ...
+
+The tropical subtraction scheme separates this:
+
+Step 1: Identify divergent variable y_k where Re(a_k(0)) <= 0.
+
+Step 2: Construct F_simple by setting y_k = 0 in the cleared polynomials Q_j.
+    This keeps only monomials whose y_k exponent is zero.
+
+Step 3: G_0 integral (pole coefficient).
+    Integrate F_simple over the remaining (n-1) variables.  This is an
+    (n-1)-dimensional convergent integral (the non-divergent variables are
+    flattened as usual).
+
+Step 4: G_1 integral (finite part).
+    G_1 = Integral F_simple * sum_of_log_insertions, where the log insertions are:
+        sum_i (a_i^(1)/a_i^(0)) * log(y'_i)  +  sum_j B_j^(1) * log(Q_j)
+    Here a^(0), a^(1) are the O(1) and O(eps) parts of the exponents, and
+    B^(0), B^(1) are the O(1) and O(eps) parts of the polynomial exponents.
+
+Step 5: Remainder integral.
+    R = Integral [F_full - F_simple] * y_k^{a_k(0) - 1} over all n variables.
+    The bracket [F_full - F_simple] vanishes at y_k = 0, so the y_k singularity
+    is integrable even at eps = 0.  Only the non-divergent variables are
+    flattened; y_k is left as a raw integration variable.
+
+Step 6: Analytic pole.
+    The 1/eps pole and the finite contribution are:
+        I_sector = G_0 / (c_k * eps) + G_1 / c_k + R + O(eps)
+
+    G_0/(c_k * eps) is computed analytically in Mathematica.
+    G_0/c_k (pole coefficient), G_1/c_k (finite part), and R are computed
+    by Monte Carlo.
+
+
+2d.  C++ CODE GENERATION  (Module 3: GenerateCppMonteCarlo)
+--------------------------------------------------------------------------------
+
+The Mathematica-side symbolic processing produces, for each sector, a list of
+{coefficient, exponentVector} pairs for the flattened polynomial.  Module 3
+converts this into a self-contained C++ source file.
+
+Expression conversion (MmaToC):
+    A recursive pattern-matching converter translates Mathematica expressions
+    to C++ strings:
+        Integer n  -->  "n.0"
+        Rational p/q  -->  "(p.0/q.0)"
+        Complex[a,b]  -->  "cx(a, b)"        (cx = std::complex<double>)
+        Power[x, n]  -->  "std::pow(x, n)"
+        Log[x]  -->  "std::log(x)"
+        Symbol lam  -->  "params[i]"          (kinematic parameter lookup)
+
+    Kinematic symbols are mapped to a params[] array so the same compiled
+    binary evaluates at any kinematic point.
+
+Polynomial evaluation (log-exp pattern):
+    Each flattened polynomial Q_j(y') is evaluated as:
+
+        double log_y[dim];
+        for (i = 0; i < dim; i++) log_y[i] = std::log(y[i]);
+
+        cx P0(0.0, 0.0);
+        P0 += coeff_0 * std::exp(alpha_0_0 * log_y[0] + alpha_0_1 * log_y[1]);
+        P0 += coeff_1 * std::exp(alpha_1_0 * log_y[0]);
+        ...
+
+    This avoids pow(y, fractional) and handles y near 0 gracefully.
+
+Four types of integrand functions are generated:
+
+    integrand_conv_N   -- convergent sector:  prefactor * prod Q_j^{B_j}
+    integrand_g0_N     -- G0 (eps=0 limit):   (n-1)-dim, simplified polys
+    integrand_g1_N     -- G1 (finite part):   G0 * log_insertion_sum
+    integrand_rem_N    -- remainder:          prefactor * y_k^{a_k-1} * (F_full - F_simple)
+
+All functions have the same signature: cx f(const double* y, const double* params).
+They are collected in a function pointer table.
+
+The generated main() function:
+    1. Reads kinematic points from an input file (N_PARAMS doubles per line)
+    2. Loops over kinematic points (OpenMP parallelized when available)
+    3. For each kinematic point, loops over all integrand functions
+    4. For each function, draws n_samples uniform points on [0,1]^dim
+    5. Accumulates mean and variance using Welford's online algorithm
+    6. Sums sector contributions (means add, variances add by independence)
+    7. Writes one line per kinematic point: re  im  err_re  err_im
+    8. Optional debug mode (-DTROPICAL_MC_DEBUG) adds NaN detection and
+       magnitude monitoring
+
+Compilation:
+    CompileCpp invokes g++ with C++17.  If OpenMP is unavailable (e.g. macOS
+    clang), it automatically retries without -fopenmp.  The generated C++
+    wraps all OpenMP calls in #ifdef _OPENMP guards.
+
+
+3.  DRIVER AND VALIDATION  (Modules 4 and 5)
+================================================================================
+
+
+3a.  EvaluateTropicalMC  (Module 4)
+--------------------------------------------------------------------------------
+
+The top-level driver that orchestrates the full pipeline:
+
+    Step 1:   Validate inputs (dimensions, finiteness)
+    Step 2:   ProcessSector for ALL simplicial cones
+    Step 3:   If RunChecks: ValidateDecomposition on first few kinematic points
+    Step 4:   Separate convergent/divergent, process divergent via Module 2
+    Step 5:   If RunChecks: ValidateSubtraction
+    Step 6:   Substitute eps -> epsValue (if applicable)
+    Step 7:   If RunChecks: debug compile and run on subset
+    Step 8:   Write kinematic data file
+    Step 9:   Release compile
+    Step 10:  Run binary, read results
+    Step 11:  Combine MC results with analytic pole contributions
+    Step 12:  Error summary and optional NIntegrate cross-check
+
+
+3b.  Validation  (Module 5: RunAllTests)
+--------------------------------------------------------------------------------
+
+18 tests verify end-to-end correctness:
+
+Tests 1-7: Convergent integrals
+    Test 1:  Convergent 2D, real exponents (A = 2, 3)
+        P = 1 + 2x1^2 + x2^2 + x1*x2^2 + 3*x1^2*x2
+        Compares sector sum vs. direct NIntegrate.
+    Test 2:  Convergent 2D, complex exponents (A = 2 + 0.5i)
+        Same polynomial, complex power.  Tests log-exp evaluation with
+        complex-valued integrand.
+    Test 3:  Divergent 1D
+        f(eps) = Integral_0^1 y^{2*eps - 1} / (1 + y^2)
+        Exact: 1/(2*eps) - log(2)/2
+        Tests pole extraction and analytic-vs-numerical agreement.
+    Test 4:  Divergent 2D
+        Tests that a 2D regulated integral produces finite values and
+        exhibits approximate 1/eps scaling.
+    Test 5:  End-to-end kinematic scan (100 lambda values)
+        P = 1 + lam*x1^2 + x2^2 + x1*x2^2, complex exponent
+        Verifies sector decomposition at 5 representative points.
+    Test 6:  Large polynomial coefficients
+        Three cases with coefficients spanning up to 8 orders of magnitude
+        (10^{-4} to 10^8).  Verifies that the tropical algorithm is correct
+        despite the tropically dominant monomial not being the numerically
+        largest one.
+    Test 7:  Higher-dimensional integrals (3D and 4D)
+        Case A (3D): P = 1 + x1^2 + x2^2 + x3^2 + x1*x2*x3, exponent -3
+            6 rays, 8 sectors.
+        Case B (4D): P = 1+x1^2+x2^2+x3^2+x4^2+x1*x2+x3*x4, exponent -4
+            8 rays, 14 sectors.
+        Verifies ProcessSector, tropical factoring, and
+        ValidateDecomposition in dimensions > 2.
+
+Tests 8-18: Divergent-integral cross-checks
+    Test 8:  Full divergent pipeline
+        Int x1^{2eps-1} (1+x1+x2+x1*x2)^{-2} dx
+        End-to-end: ProcessSector -> ProcessDivergentSector ->
+        ValidateSubtraction.
+    Test 9:  Multi-epsilon reconstruction with remainder convergence
+        Evaluates at multiple eps values, checks that the remainder
+        converges as eps -> 0.  Uses eps-dependent threshold.
+    Test 10: Divergent variable index permutation
+        Same integral but with x2 as the divergent variable (regulator
+        on second variable).  Tests that the pipeline is not hardcoded
+        to diverge in x1.
+    Test 11: Epsilon-dependent polynomial exponents (B1 != 0)
+        Int x1^{2eps-1} (1+x1+x2+x1*x2)^{-2+eps} dx
+        Polynomial exponent depends on eps.  Verifies B1 = {1} and
+        that G1 log-insertions include polynomial log terms.
+    Test 12: Full sector sum (convergent + divergent vs direct)
+        Sums all sectors (convergent evaluated directly, divergent via
+        subtraction) and compares against direct NIntegrate at finite eps.
+    Test 13: C++ codegen for divergent sectors
+        Generates C++ code for a divergent integral, compiles it, and
+        verifies it runs successfully.
+    Test 14: Pole coefficient accuracy
+        Compares G0/ck (analytic pole coefficient) against a numerical
+        slope estimate from evaluations at two eps values.
+    Test 15: G1 log-insertion structural + numerical check
+        Verifies the structure of G1 log-insertions (variable terms and
+        polynomial terms) and checks numerical accuracy.  Uses an
+        integral-scale metric for error.
+    Test 16: Multiple-polynomial divergent integral
+        Int x1^{2eps-1} (1+x1+x2)^{-1} (1+x1*x2)^{-1} dx
+        Two polynomials with separate exponents.  Skips nested divergences.
+    Test 17: 3D divergent integral
+        Int x1^{2eps-1} (1+x1+x2+x3+x1*x2*x3)^{-3} dx
+        Verifies G0Dimension = 2 (n-1 = 2).  Uses relaxed 10% threshold.
+    Test 18: Divergent integral with complex polynomial exponents
+        Int x1^{2eps-1} (1+x1+x2+x1*x2)^{-2+I} dx
+        Combines 1/eps divergence with complex polynomial exponent.
+        Verifies B0 = {-2+I}.  Uses 5% threshold for complex exponents.
+
+
+4.  FUNCTION REFERENCE
+================================================================================
+
+
+PUBLIC FUNCTIONS (TropicalEval` context)
+--------------------------------------------------------------------------------
+
+ProcessSector[integrandSpec, dualVertices, simplex, coneIndex]
+    Performs monomial change of variables, tropical factoring, and flattening
+    for one simplicial cone.
+    Returns: Association with keys ConeIndex, RayMatrix, DetM, NewExponents,
+    MinExponents, ClearedPolys, FlattenedPolys, Prefactor, IsDivergent,
+    DivergentVariable, Dimension, PolynomialExponents, etc.
+
+CheckFlatteningMagnitude[sectorData, nSamples]
+    Evaluates the flattened integrand at random points on [0,1]^n and
+    reports min/max/mean magnitude.  Useful for detecting high-variance
+    sectors (e.g. from large polynomial coefficients).
+
+ValidateDecomposition[integrandSpec, fanData, testKinematics, precisionGoal]
+    Computes the original integral via direct NIntegrate on [0,inf)^n, then
+    computes each sector integral via NIntegrate on [0,1]^n, and compares.
+    Returns: Association with DirectResult, SectorSum, RelativeError,
+    SectorResults.
+
+IdentifyDivergences[sectorData, eps]
+    Expands the effective exponents in eps, finds any variable y_k with
+    Re(a_k(0)) <= 0.  Returns the divergent variable index, c_k, and
+    the eps-expansion coefficients a^(0), a^(1).
+
+ProcessDivergentSector[sectorData, integrandSpec]
+    Constructs the G0, G1, and remainder integrands for a sector with a
+    1/eps divergence.  Returns: Association with G0FlatPolys, G0Prefactor,
+    G1LogInsertions, Remainder, AnalyticPole, etc.
+
+ValidateSubtraction[divSectorData, sectorData, integrandSpec, testKinematics, testEpsilon]
+    Self-consistency check: evaluates the original sector integral at finite
+    eps, then checks that G0/(c_k*eps) + G1/c_k + Remainder agrees.
+
+MmaToC[expr, paramMap]
+    Converts a Mathematica expression to a C++ code string using recursive
+    pattern matching.  The paramMap association maps kinematic symbols to
+    "params[i]" strings.
+
+GenerateCppMonteCarlo[convergentSectors, divergentSectors, integrandSpec, outputFile]
+    Generates a complete, self-contained C++ source file with all integrand
+    functions, function pointer table, file I/O, and main() with OpenMP
+    parallelization and Welford variance estimation.
+    Options: "NSamples" (default 10^6), "MaxDim" (default 20), "SeedBase" (42).
+
+CompileCpp[srcFile, outputBinary, debug]
+    Compiles the generated C++ code.  Automatically retries without -fopenmp
+    if the compiler doesn't support it (e.g. macOS clang).
+    debug=True adds -DTROPICAL_MC_DEBUG for NaN detection and diagnostics.
+
+EvaluateTropicalMC[integrandSpec, fanData, kinematicPoints, opts]
+    Top-level driver.  Takes an integrand specification and fan data,
+    processes all sectors, generates C++, compiles, runs, reads results,
+    and returns a list of result associations.
+    Options: NSamples, NThreads, RunChecks, EpsilonValue, TestEpsilon,
+    PrecisionGoal, WorkingDirectory, Verbose.
+
+ParsePolynomial[poly, vars]
+    Parses a symbolic polynomial into a list of {coefficient, exponentVector}
+    pairs.
+
+RunAllTests[]
+    Runs the 18-test validation suite with structured PASS/FAIL reporting.
+
+
+DATA STRUCTURES
+--------------------------------------------------------------------------------
+
+IntegrandSpec (Association):
+    "Polynomials"        -> {P1, P2, ...}       symbolic polynomials in x[i]
+    "MonomialExponents"  -> {A1, A2, ...}       one per variable
+    "PolynomialExponents"-> {B1, B2, ...}       one per polynomial
+    "Variables"          -> {x[1], x[2], ...}
+    "KinematicSymbols"   -> {lam, mu, ...}      or {} if none
+    "RegulatorSymbol"    -> eps                  or None
+
+SectorData (Association, returned by ProcessSector):
+    "ConeIndex"          -> integer
+    "RayMatrix"          -> M (n x n matrix)
+    "DetM"               -> det(M)
+    "SelectedRays"       -> {rho_1, ..., rho_n}
+    "RawExponents"       -> rawA (before tropical factoring)
+    "NewExponents"       -> effectiveA (after tropical factoring)
+    "MinExponents"       -> {{d_{1,1},...,d_{1,n}}, ...} per polynomial
+    "TransformedPolys"   -> monomials in y-space (signed exponents)
+    "ClearedPolys"       -> monomials after factoring (non-negative exponents)
+    "FlattenedPolys"     -> monomials after flattening (exps divided by a_eff)
+    "Prefactor"          -> |det(M)| / prod(a_i^eff)
+    "IsDivergent"        -> True/False
+    "DivergentVariable"  -> index k (0 if convergent)
+    "Dimension"          -> n
+    "PolynomialExponents"-> {B1, ...}
+
+DivergentSectorData (Association, returned by ProcessDivergentSector):
+    "G0FlatPolys"        -> flattened simplified polys for (n-1)-dim integral
+    "G0Prefactor"        -> prefactor for G0
+    "G0Dimension"        -> n-1
+    "G1LogInsertions"    -> <| "VariableTerms" -> ..., "PolynomialTerms" -> ... |>
+    "Remainder"          -> <| "FullPolys", "SimplifiedPolys", "Prefactor",
+                               "DivVarIndex", "DivVarExp", "Dimension", ... |>
+    "AnalyticPole"       -> 1/c_k
+    "ck"                 -> leading coefficient of a_k(eps)
+
+
+5.  FILES
+================================================================================
+
+tropical_fan.wl            Tropical fan computation via Polymake (dependency)
+tropical_eval.wl           Main evaluation package (this code)
+tropical_eval_examples.wl  14 worked examples + 18-test validation suite
+tropical_fan_examples.wl   Examples for the fan package
+
+
+6.  EXAMPLES  (tropical_eval_examples.wl)
+================================================================================
+
+Example 1:  Basic 2D convergent integral
+    Int dx1 dx2 / (1 + x1^2 + x2^2)^3
+    Step-by-step ProcessSector output for all 3 sectors, showing det(M),
+    rawA, minExponents, effectiveA, prefactor, and cleared polynomial.
+    Validated against NIntegrate.
+
+Example 2:  Complex exponents
+    Int dx1 dx2 / (1 + 2x1^2 + x2^2 + x1*x2^2 + 3x1^2*x2)^{2+I}
+    Complex polynomial power.  Demonstrates CheckFlatteningMagnitude and
+    full ValidateDecomposition with complex-valued integrand.
+
+Example 3:  Kinematic-dependent integral
+    Int dx1 dx2 / (1 + lam*x1^2 + x2^2 + x1*x2^2)^2
+    Coefficient 'lam' varies.  Shows symbolic ProcessSector output and
+    validates at lam = 0.5, 1, 2, 5.
+
+Example 4:  Tropical factoring step by step
+    Walks through the entire tropical factoring procedure for one sector:
+    rays, M matrix, raw exponents, transformed monomials (signed exponents),
+    min exponents, cleared polynomial Q, effective exponents, and flattened
+    polynomial with exponents divided by a_eff.
+
+Example 5:  MmaToC expression converter
+    Demonstrates conversion of Integer, Rational, Real, Complex, Power,
+    Sqrt, Log, Exp, Plus, Times, and kinematic parameter expressions to
+    C++ code strings.
+
+Example 6:  C++ code generation and execution (no kinematics)
+    Int dx1 dx2 / (1 + x1^2 + x2^2)^3 = Pi/8
+    Full pipeline: ProcessSector -> GenerateCppMonteCarlo -> CompileCpp ->
+    run binary -> compare MC result against exact value.
+
+Example 7:  C++ with kinematic scan
+    Int dx1 dx2 / (1 + lam*x1^2 + x2^2 + x1*x2^2)^2
+    Generates C++, compiles once, evaluates at 10 values of lam.
+    Compares MC results against NIntegrate at each point.
+
+Example 8:  ParsePolynomial utility
+    Shows how ParsePolynomial extracts {coefficient, exponentVector} pairs
+    from a symbolic polynomial with kinematic-dependent coefficients.
+
+Example 9:  Multiple polynomials (product of two factors)
+    Int dx1 dx2 x1^{1/2} / [(1+x1+x2)^2 * (1+x1*x2)]
+    Two polynomials with separate exponents plus a monomial prefactor.
+    Fan from product P1*P2, 5 sectors, validated against NIntegrate.
+
+Example 10: Non-trivial numerator — single numerator polynomial
+    Int dx1 dx2 (1+x1)^{3/2} / (1+x1^2+x2^2+x1*x2)^3
+    Positive polynomial exponent (numerator) and negative (denominator).
+    IntegrandSpec lists both with signed exponents: {3/2, -3}.
+    Fan from product P_num * P_den (first power only).
+
+Example 11: Non-trivial numerator — two numerator factors
+    Int dx1 dx2 (1+x1+x2)^{1/2} * (x1+x2)^{1/3} / (1+2x1^2+x2^2+x1*x2^2)^2
+    Three polynomials: two in numerator (B = 1/2, 1/3), one in denominator
+    (B = -2).  Six sectors, all convergent.
+
+Example 12: Numerator with kinematic-dependent coefficients
+    Int dx1 dx2 (1+lam*x1)^{3/2} / (1+x1^2+x2^2)^3
+    Numerator coefficient varies with lam.  Fan uses unit-coefficient proxy
+    (1+x1)*P_den since the fan is independent of coefficient values.
+    Validates at lam = 0.5, 1, 2, 5.
+
+Example 13: 3D convergent integral
+    Int dx1 dx2 dx3 / (1 + x1^2 + x2^2 + x3^2 + x1*x2*x3)^3
+    First example in dimension > 2.  6 rays, 8 sectors.  Validates that
+    ProcessSector, tropical factoring, and ValidateDecomposition all
+    work correctly in 3D.
+
+Example 14: 4D convergent integral
+    Int dx1 dx2 dx3 dx4 / (1+x1^2+x2^2+x3^2+x4^2+x1*x2+x3*x4)^4
+    Tests the pipeline in 4 dimensions.  8 rays, 14 sectors (all convergent).
+    Mix of degree-1 and degree-2 monomials gives a richer Newton polytope.
+
+
+7.  USAGE
+================================================================================
+
+Minimal example (denominator only):
+
+    Get["tropical_eval.wl"];
+
+    poly = 1 + 2 x[1]^2 + x[2]^2 + x[1] x[2]^2;
+    vars = {x[1], x[2]};
+
+    spec = <|
+      "Polynomials"        -> {poly},
+      "MonomialExponents"  -> {0, 0},
+      "PolynomialExponents"-> {-2},
+      "Variables"          -> vars,
+      "KinematicSymbols"   -> {},
+      "RegulatorSymbol"    -> None
+    |>;
+
+    verts   = PolytopeVertices[poly^(-1), vars];
+    fanData = ComputeDecomposition[verts];
+
+    vr = ValidateDecomposition[spec, fanData, {}, 3];
+    Print["Rel error: ", vr["RelativeError"]];
+
+Numerator + denominator example:
+
+    pNum = 1 + x[1];
+    pDen = 1 + x[1]^2 + x[2]^2;
+    vars = {x[1], x[2]};
+
+    spec = <|
+      "Polynomials"        -> {pNum, pDen},
+      "MonomialExponents"  -> {0, 0},
+      "PolynomialExponents"-> {3/2, -3},           (* numerator^{3/2} * denom^{-3} *)
+      "Variables"          -> vars,
+      "KinematicSymbols"   -> {},
+      "RegulatorSymbol"    -> None
+    |>;
+
+    (* Fan: just multiply polynomials, no powers needed *)
+    verts   = PolytopeVertices[(pNum * pDen)^(-1), vars];
+    fanData = ComputeDecomposition[verts];
+
+    vr = ValidateDecomposition[spec, fanData, {}, 3];
+    Print["Rel error: ", vr["RelativeError"]];
+
+Kinematic scan (one compile, many evaluations):
+
+    poly = c0 + c1 x[1]^2 + c2 x[2]^2;
+    vars = {x[1], x[2]};
+
+    spec = <|
+      "Polynomials"        -> {poly},
+      "MonomialExponents"  -> {0, 0},
+      "PolynomialExponents"-> {-2},
+      "Variables"          -> vars,
+      "KinematicSymbols"   -> {c0, c1, c2},
+      "RegulatorSymbol"    -> None
+    |>;
+
+    (* Fan from unit-coefficient proxy *)
+    verts   = PolytopeVertices[(1 + x[1]^2 + x[2]^2)^(-1), vars];
+    fanData = ComputeDecomposition[verts];
+
+    (* 7200 kinematic points: one compile, one run *)
+    kinPoints = Table[{1.0, 0.5 + 0.01 i, 1.0 + 0.005 i}, {i, 7200}];
+    results = EvaluateTropicalMC[spec, fanData, kinPoints];
+
+Command line:
+
+    /Applications/Mathematica.app/Contents/MacOS/WolframKernel -script tropical_eval_examples.wl

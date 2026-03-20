@@ -1,0 +1,181 @@
+================================================================================
+  FIESTA vs Tropical Monte Carlo: Cross-Check Summary
+  Date: 2026-03-18
+================================================================================
+
+This document summarizes the cross-validation between FIESTA5 (sector
+decomposition with delta-function/simplex domain) and the tropical Monte
+Carlo code (tropical fan decomposition on [0,∞) domain).
+
+The two codes compute the same integrals in different representations,
+related by the GL(1) gauge transformation (Cheng-Wu theorem):
+
+  ∫₀^∞ dⁿx f(1,x₁,...,xₙ)  =  ∫_Δ dⁿt · t₀^{D-n-1} · f(t₀,t₁,...,tₙ)
+
+where t₀ = 1-∑tᵢ, D is the homogeneity degree of the integrand, and Δ
+is the simplex. This allows direct numerical comparison of both the
+1/ε pole and the ε⁰ finite part.
+
+Scripts are in: tropical_code_claudef/FIESTA_Compare/
+
+
+================================================================================
+  1. SIMPLE CONVERGENT INTEGRAL: ∫₀^∞ dx₁dx₂ / (1+x₁²+x₂²)³ = π/8
+================================================================================
+
+  Homogenization: P_hom = x₀²+x₁²+x₂², degree 2, D=6, D-E=3
+  FIESTA form: ∫ δ(1-x₀-x₁-x₂) x₀³ (x₀²+x₁²+x₂²)⁻³
+
+  Code         Method           Result         Error       Exact
+  -----------  ---------------  -----------    ---------   -----------
+  FIESTA       SDEvaluateDirect 0.392698       ±9.7e-5    π/8 = 0.392699
+  Tropical MC  Sector sum       0.392699       ~7e-7      π/8 = 0.392699
+  Tropical MC  C++ MC (500K)    0.39224        ±3.4e-4    π/8 = 0.392699
+
+  Status: PASS — both codes match exact value.
+
+
+================================================================================
+  2. DIVERGENT INTEGRAL (FACTORED): Γ(2ε)Γ(2-2ε) = 1/(2ε) - 1 + O(ε)
+     ∫₀^∞ dx₁dx₂ x₁^{2ε-1} / [(1+x₁)(1+x₂)]²
+================================================================================
+
+  Homogenization: P_hom = (x₀+x₁)(x₀+x₂), degree 2, D=5-2ε, D-E=2-2ε
+  FIESTA form: ∫ δ(1-x₀-x₁-x₂) x₀^{2-2ε} x₁^{2ε-1} [(x₀+x₁)(x₀+x₂)]⁻²
+
+  Exact Laurent expansion: 1/(2ε) - 1 + O(ε)
+
+               FIESTA (5M Vegas)    Tropical MC (NIntegrate)   Exact
+  Pole (1/ε):  0.499993 ± 8e-6      0.500000                   0.5
+  Finite (ε⁰): -1.000012 ± 4.5e-5  -0.999999986               -1.0
+
+  Status: PASS — pole and finite match to 5+ significant digits.
+
+
+================================================================================
+  3. DIVERGENT INTEGRAL (NON-FACTORING): No exact result available
+     ∫₀^∞ dx₁dx₂ x₁^{2ε-1} / (1+x₁+x₂+x₁x₂²)²
+================================================================================
+
+  Homogenization: P_hom = x₀³+x₀²x₁+x₀²x₂+x₁x₂², degree 3, D=7-2ε
+
+               FIESTA (5M Vegas)    Tropical MC (NIntegrate)
+  Pole (1/ε):  0.499993 ± 8e-6      0.500000
+  Finite (ε⁰): -1.570788 ± 3.1e-4  -1.570800
+
+  Status: PASS — independent codes agree to 4 significant digits.
+  (Difference well within FIESTA's reported MC error.)
+
+
+================================================================================
+  4. BUBBLEPP PRESECTOR 1: Full 5D cosmological integral
+     Equilateral kinematic point k₁=k₂=k₃=1, μ=1/4
+================================================================================
+
+  This is the actual bubble pp bispectrum presector 1 integral with:
+  - 5 integration variables (x[1]..x[5])
+  - 6 polynomials (including a 33-term degree-4 kinematic polynomial)
+  - 14 divergent tropical cones (all with cₖ = 2/7)
+  - 36 convergent tropical cones
+
+  GL(1) conversion to FIESTA:
+    6 simplex variables, 12 FIESTA functions, δ(1-∑xᵢ)
+    x₀ power = 6 + 4ε (from D=12+4ε, E+1=6)
+
+  4a. FIESTA evaluation (SDEvaluateDirect, 50M Vegas samples):
+      64 FIESTA sectors, up to 5D integration
+      Pole (1/ε):  0.000513 ± ~0
+      Finite (ε⁰): 0.024968 ± 1.2e-5
+
+  4b. Tropical MC evaluation (compiled C++, 4 OpenMP threads):
+      78 integrand functions (36 conv + 14 G0 + 14 G1 + 14 remainder)
+      MC TOTAL includes G0 as a sub-integrand (by design)
+      Proper finite part comparison: TOTAL - G0
+
+  4c. Convergence study (N = 50K to 10M samples):
+
+  POLE (G0):
+  N_samples    G0_MC        MC_err      FIESTA     |diff|    sigma
+  -----------------------------------------------------------------
+  50,000       0.000511     2.0e-6      0.000513   2.0e-6    1.0
+  200,000      0.000514     1.0e-6      0.000513   1.0e-6    1.0
+  1,000,000    0.000513     4.6e-7      0.000513   <1e-7     <1
+  5,000,000    0.000514     2.1e-7      0.000513   ~1e-7     ~0.5
+  10,000,000   0.000513     1.5e-7      0.000513   <1e-7     <1
+
+  FINITE (TOTAL - G0):
+  N_samples    TOTAL-G0     MC_err      FIESTA     |diff|    comb σ
+  -----------------------------------------------------------------
+  50,000       0.024985     1.3e-4      0.024968   1.7e-5    0.1
+  200,000      0.024793     6.3e-5      0.024968   1.8e-4    2.7
+  1,000,000    0.024937     3.3e-5      0.024968   3.1e-5    0.9
+  5,000,000    0.024956     1.4e-5      0.024968   1.2e-5    0.7
+  10,000,000   0.024935     1.3e-5      0.024968   3.3e-5    1.9
+
+  MC errors scale as 1/√N (verified: err×√N ≈ const).
+
+  Status: PASS — pole matches exactly, finite agrees within 1.9σ.
+
+
+================================================================================
+  5. INVESTIGATION OF ε/ε CROSS-TERMS
+================================================================================
+
+  An initial apparent 37σ discrepancy in the finite part was traced to
+  a comparison error: the MC TOTAL integral includes the G0 (pole)
+  integrand as one of its sub-integrands. FIESTA's ε⁰ coefficient does
+  not include the pole coefficient. The correct comparison is:
+
+    MC finite  =  TOTAL - G0     (not just TOTAL)
+    FIESTA ε⁰  =  c₀            (pole-subtracted by construction)
+
+  The bispectrum combination formula correctly accounts for this:
+
+    finite = pref × (TOTAL + (γ-1) × G0)
+           = pref × (TOTAL - G0) + pref × γ × G0
+
+  where:
+  - (TOTAL - G0) cancels the G0 inside TOTAL
+  - γ × G0 is the ε/ε cross-term from the external prefactor's
+    ε-dependence (γ = PrefactorLogDeriv)
+
+  The G1 log-insertion terms in ProcessDivergentSector correctly
+  capture the integrand's internal ε-derivative:
+  - Variable terms: a₁ᵢ/a₀ᵢ × log(yᵢ) for non-divergent variables
+  - Polynomial terms: B₁ⱼ × log(Pⱼ) for polynomial exponents
+
+  The flattened prefactor |det(M)|/∏a₀ᵢ is ε-independent by
+  construction (flattening is performed at ε=0), so no separate
+  prefactor ε-derivative is needed in G1.
+
+  Status: No bug found. The ε/ε effect is correctly handled.
+
+
+================================================================================
+  OVERALL CONCLUSION
+================================================================================
+
+  All cross-checks pass. The tropical Monte Carlo code produces results
+  consistent with FIESTA's independent sector decomposition for:
+
+  - Convergent integrals (exact to ~10⁻⁶ relative error)
+  - Divergent 1/ε pole coefficients (exact match in all cases)
+  - ε⁰ finite parts (agreement within 2σ for the full 5D bubblepp integral)
+  - Proper 1/√N MC convergence scaling
+
+  The GL(1)/Cheng-Wu gauge transformation correctly converts between the
+  [0,∞) affine chart (tropical MC) and the simplex with delta function
+  (FIESTA), as verified by the paper arXiv:2204.02988 (Mizera).
+
+
+================================================================================
+  FILES
+================================================================================
+
+  compare_pole_and_finite.wl    GL(1)-converted comparison (tests 1-3)
+  fiesta_bubblepp_standalone.wl FIESTA on bubblepp presector 1 (simplex form)
+  compare_bubblepp_sector.wl    Tropical MC on bubblepp presector 1
+  convergence_study_v2.wl       MC convergence study (50K-10M samples)
+  diagnose_eps_eps.wl           ε/ε cross-term investigation
+  paper_v2.tex                  Mizera paper on GL(1) gauge fixing
+  FIESTA5.tex                   FIESTA5 documentation

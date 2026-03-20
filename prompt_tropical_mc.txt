@@ -1,0 +1,396 @@
+PROMPT: Numerical Evaluation of Generalized Euler Integrals via Tropical Decomposition
+======================================================================================
+
+OVERVIEW
+--------
+I need a Mathematica + C++ pipeline for numerically evaluating generalized Euler integrals of the form
+
+  Integral[0,Infinity] (Prod_i dx_i x_i^{A_i}) Prod_j P_j(x_i)^{B_j}
+
+using tropical decomposition. The integrals depend on external kinematic parameters, and I need to evaluate each integral at 7200 distinct kinematic points.
+
+Key structural assumptions:
+  - All polynomials P_j have strictly positive real coefficients (which may depend on kinematic parameters), so P_j evaluates to a positive real number everywhere on the integration domain.
+  - The exponents A_i and B_j are generically complex (arising from contour deformation of de Sitter integrals).
+  - Therefore: log(P_j) is always real, pow(P_j, B_j) = exp(B_j * log(P_j)) is well-defined with no branch cut ambiguity, and the integrand is complex-valued with the only source of complex numbers being the exponents.
+
+EXISTING CODEBASE
+-----------------
+The file tropical_fan.wl is the existing Mathematica package for computing tropical fans. Before writing any new code, READ tropical_fan.wl thoroughly. It contains:
+  - Public function definitions for computing the tropical fan of a polynomial or product of polynomials
+  - Usage examples demonstrating how the public functions are called, what input format they expect, and what output format they produce
+
+You MUST:
+  1. Read tropical_fan.wl and understand all public functions, their signatures, input formats, and output data structures.
+  2. Use the EXACT data structures returned by the existing functions. Do not invent your own representation of rays, cones, or fans. Build all new code to consume the output of tropical_fan.wl directly.
+  3. If tropical_fan.wl returns ray vectors as rows vs columns, or indexes cones starting from 0 vs 1, or uses any particular convention, match that convention exactly.
+  4. Write the new evaluation code as a separate .wl package (tropical_eval.wl) that imports tropical_fan.wl via Get or Needs, so the two packages compose cleanly.
+
+The pipeline is:
+  (A) Mathematica (tropical_fan.wl): computes the tropical fan, returning rays and simplicial cones.
+  (B) Mathematica (new code, tropical_eval.wl): takes the fan output, performs symbolic coordinate transformations, epsilon-expansion for divergent integrals, and generates C++ code.
+  (C) Generated C++ code: runs Monte Carlo integration over all sectors and all 7200 kinematic points in parallel.
+  (D) Mathematica (new code): reads C++ output and assembles final results.
+
+
+MODULE 1: SYMBOLIC SECTOR PROCESSING IN MATHEMATICA
+----------------------------------------------------
+Write a Mathematica function ProcessSector that takes:
+  - Polynomials {P_1, ..., P_m} in symbolic variables {x_1, ..., x_n}, with real positive coefficients depending on kinematic parameters
+  - Monomial exponents {A_1, ..., A_n} (complex, may depend on epsilon)
+  - Polynomial exponents {B_1, ..., B_m} (complex, may depend on epsilon)
+  - A single simplicial cone, in whatever format tropical_fan.wl uses to represent a cone (read the file to determine this)
+
+and performs the following:
+
+1. Monomial change of variables: x_i = Prod_j y_j^{-rho_j[i]}, with y_j in [0,1].
+
+   Let M be the matrix with M_{ij} = -rho_j[i] (columns are negated ray vectors). The Jacobian is |det(M)|. After substitution:
+
+     |det(M)| * Integral[0,1]^n (Prod_i dy_i y_i^{a_i - 1}) Prod_j P_j(y)^{B_j}
+
+   where a_i = Sum_k (A_k + 1) * (-rho_i[k]).
+
+   CHECKS after step 1:
+   (a) Verify det(M) != 0. If zero, the cone is degenerate; abort with an error message identifying which cone failed.
+   (b) Verify the number of ray vectors equals the number of integration variables n (simplicial cone condition).
+   (c) Run the 2D benchmark: for the polynomial P = 1 + 2 x1^2 + x2^2 + x1 x2^2 + 3 x1^2 x2 with rho_1 = (0,1), rho_2 = (1,1), A_1 = A_2 = 0, and polynomial exponent -A, verify that the transformed prefactors are y_1^{2A-2} y_2^{3A-3} (i.e., a_1 = 2A-1, a_2 = 3A-2). Hard-code this as a unit test that runs when the package loads or on demand.
+   (d) For each monomial in each transformed polynomial, verify that substituting y_i = 1 for all i recovers the original monomial evaluated at x_i = 1 for all i. This catches sign and index errors in the exponent transformation.
+
+2. Flattening substitution: y_i -> (y_i')^{1/a_i}, absorbing the monomial prefactor:
+
+     |det(M)| / Prod_i a_i * Integral[0,1]^n Prod_i dy_i' * Prod_j P_j(...)^{B_j}
+
+   Each monomial c * y_1^{e_1} ... y_n^{e_n} in P_j becomes c * Prod_i (y_i')^{e_i/a_i}. Since a_i is complex, the exponents e_i/a_i are complex. The base y_i' is in [0,1], so y_i'^{e_i/a_i} = exp((e_i/a_i) * log(y_i')) is well-defined.
+
+   CHECKS after step 2:
+   (a) For convergent integrals, verify Re(a_i) > 0 for all i. If not, the integral is divergent in this sector and should be routed to Module 2 instead.
+   (b) Verify that the dominant monomial in each polynomial (the one that the tropical fan says should dominate in this cone) has all flattened exponents e_i/a_i satisfying Re(e_i/a_i) >= 0. After flattening, the dominant monomial should evaluate to a constant (all exponents zero or the monomial should be the one that maps to the constant term), confirming the integrand is O(1).
+   (c) Spot-check: pick a random point y' in (0,1)^n, compute the flattened integrand numerically, and verify its magnitude is O(1) (say, between 10^{-3} and 10^{3}). If it is orders of magnitude away from 1, something is wrong. Implement this as a function CheckFlatteningMagnitude[sectorData, nSamples] that tests nSamples random points.
+
+3. Output:
+   - Complex prefactor |det(M)| / Prod_i a_i (symbolic in kinematics and epsilon)
+   - For each polynomial P_j: list of monomials as (real coefficient in kinematics, list of complex exponents of y_i')
+   - Polynomial exponents B_j
+
+CHECKS on the full set of sectors:
+   (a) Completeness check: verify that the number of sectors matches the number of simplicial cones returned by tropical_fan.wl. No cones should be silently dropped.
+   (b) Numerical cross-check against direct NIntegrate: for user-supplied test values of the kinematic parameters, evaluate the original (un-decomposed) integral via NIntegrate, then evaluate the sum over all sector integrals (using NIntegrate on each sector's flattened integrand). Verify agreement to the requested precision. Implement as a function ValidateDecomposition[integrandSpec, fanData, testKinematics, precisionGoal] that returns {directResult, sectorSum, relativeError} and issues a warning if the relative error exceeds 10^{-precisionGoal+1}.
+
+
+MODULE 2: DIVERGENCE REGULATION (TROPICAL SUBTRACTION)
+-------------------------------------------------------
+For integrals that diverge as epsilon -> 0, implement the following in Mathematica:
+
+The starting point is the sector integral AFTER the monomial change of variables (Module 1 step 1) but BEFORE flattening:
+
+  Integral[0,1]^n (Prod_i dy_i y_i^{a_i(epsilon) - 1}) * F(y, epsilon)
+
+where F = Prod_j P_j(y)^{B_j(epsilon)} is bounded.
+
+Step 1 -- Identify divergences:
+Expand a_i(epsilon) = a_i^{(0)} + a_i^{(1)} * epsilon + ... . Flag variable y_k as divergent if Re(a_k^{(0)}) <= 0. In the cases we consider, a_k(epsilon) = c_k * epsilon + O(epsilon^2) for a single variable y_k per sector.
+
+CHECKS after step 1:
+  (a) Report which sectors are divergent and which variable is divergent in each. Print a summary: "Sector s: variable y_k divergent, a_k(epsilon) = c_k * epsilon + ..., c_k = ...".
+  (b) Verify that at most one variable per sector is divergent (the code currently assumes this). If multiple variables diverge, abort with a clear error message saying nested subtraction is not yet implemented.
+  (c) Verify c_k != 0. If c_k = 0, the divergence is worse than 1/epsilon and requires higher-order subtraction; abort with error.
+  (d) Verify all non-divergent variables have Re(a_i^{(0)}) > 0 strictly.
+
+Step 2 -- Construct the simplified integrand:
+Set y_k = 0 in the bounded factor:
+  F_simple(y) = F(y_1, ..., y_{k-1}, 0, y_{k+1}, ..., y_n)
+
+CHECKS after step 2:
+  (a) Verify that F_simple is independent of y_k (substitute a symbolic y_k and check it does not appear).
+  (b) Verify F_simple evaluates to the same value as F when y_k is numerically set to 0 for a few random values of the other variables.
+
+Step 3 -- Compute the divergent contribution:
+The simplified integral factorizes:
+
+  [Integral_0^1 dy_k y_k^{a_k(epsilon)-1}] * [Integral_{[0,1]^{n-1}} Prod_{i != k} dy_i y_i^{a_i(epsilon)-1} * F_simple]
+
+The y_k integral is 1/a_k(epsilon) = 1/(c_k * epsilon) + ... (analytic).
+
+The (n-1)-dimensional integral must be expanded in epsilon to O(epsilon^1) because it multiplies a 1/epsilon pole. The expansion produces:
+
+  y_i^{a_i(epsilon)-1} = y_i^{a_i(0)-1} * (1 + a_i^{(1)} * epsilon * log(y_i) + ...)
+  P_j^{B_j(epsilon)} = P_j^{B_j(0)} * (1 + B_j^{(1)} * epsilon * log(P_j) + ...)
+
+So the (n-1)-dimensional integral expands as G_0 + epsilon * G_1 + O(epsilon^2), where:
+  - G_0 is an (n-1)-dimensional integral with epsilon=0 exponents
+  - G_1 involves extra log(y_i) and log(P_j) factors
+
+The divergent contribution is: G_0/(c_k * epsilon) + G_1/c_k + O(epsilon).
+
+For G_0 and G_1: flatten the (n-1) non-divergent variables y_i (i != k) via the standard substitution y_i -> (y_i')^{1/a_i(0)}, and send to C++ for Monte Carlo. The G_1 integrand is identical to G_0 except it includes multiplicative log factors.
+
+CHECKS after step 3:
+  (a) Verify the epsilon expansion is correct by evaluating the (n-1)-dimensional integral numerically at epsilon = 0.01 and comparing against G_0 + 0.01 * G_1. The relative error should be O(epsilon^2) ~ 10^{-4}.
+  (b) For G_0: apply the same flattening checks as Module 1 step 2 (Re(a_i(0)) > 0 for all non-divergent variables, integrand magnitude O(1)).
+  (c) For G_1: verify that the log factors are correctly placed by evaluating the G_1 integrand at a test point and comparing against numerical differentiation of the G_0 integrand with respect to epsilon.
+
+Step 4 -- Construct the finite remainder:
+Form the n-dimensional integral:
+
+  R = Integral[0,1]^n Prod_i dy_i y_i^{a_i(0)-1}
+        * [Prod_j P_j(y)^{B_j(0)} - Prod_j P_j(y_1,...,0,...,y_n)^{B_j(0)}]
+
+Flatten ONLY the non-divergent variables. Leave y_k unflattened. The resulting integrand is a function of (y_1', ..., y_k, ..., y_n') on [0,1]^n, with non-uniform but integrable weighting in y_k.
+
+CHECKS after step 4:
+  (a) Verify the bracket vanishes at y_k = 0: evaluate at several random points with y_k = 10^{-10} and confirm the bracket is O(y_k) or smaller.
+  (b) Verify the remainder integrand (including the y_k^{a_k(0)-1} prefactor) is bounded: evaluate at many random points in [0,1]^n including points with y_k near 0 (e.g., y_k = 10^{-8}, 10^{-6}, 10^{-4}, 10^{-2}) and verify the magnitude stays bounded (say < 10^3).
+  (c) Self-consistency check: for test kinematic values, verify numerically that
+        (divergent contribution at finite epsilon) + (remainder) = (original sector integral at finite epsilon)
+     by evaluating both sides at epsilon = 0.01 using NIntegrate. Specifically:
+        Original = NIntegrate of the full sector integrand at epsilon = 0.01
+        Reconstructed = (G_0/(c_k * 0.01) + G_1/c_k) + NIntegrate of remainder
+     These should agree to high precision. Implement as ValidateSubtraction[sectorData, testKinematics, testEpsilon].
+
+Step 5 -- Output for each divergent sector:
+  - Analytic Laurent series coefficients (symbolic in kinematic parameters)
+  - G_0 integrand ((n-1)-dimensional, flattened, for C++)
+  - G_1 integrand ((n-1)-dimensional, flattened, with log insertions, for C++)
+  - Finite remainder integrand (n-dimensional, partially flattened, for C++)
+
+
+MODULE 3: C++ CODE GENERATION
+------------------------------
+Write a Mathematica function GenerateCppMonteCarlo that takes the processed sector data from Modules 1-2 and generates a self-contained C++ source file.
+
+The C++ code evaluates three types of integrands:
+  (a) Convergent sector integrands (fully flattened, from Module 1)
+  (b) G_0 and G_1 integrands from divergent sectors (fully flattened in n-1 variables, from Module 2)
+  (c) Finite remainder integrands from divergent sectors (partially flattened, from Module 2)
+
+All three types are functions mapping (double* y, double* params) -> std::complex<double>, so the Monte Carlo loop is identical for all of them.
+
+--- Structure of the generated C++ code ---
+
+Header and includes:
+  #include <complex>, <cmath>, <random>, <fstream>, <vector>, <omp.h>, <iostream>, <cassert>
+  using cx = std::complex<double>;
+
+Integrand functions -- For each sector/integrand, generate an inline function:
+
+  inline cx integrand_s(const double* y, const double* params) {
+
+      // Precompute log(y[i]) (real) for all integration variables
+      double log_y[n];
+      for (int i = 0; i < n; i++)
+          log_y[i] = (y[i] > 1e-300) ? std::log(y[i]) : -700.0;
+
+      // --- Evaluate each polynomial P_j ---
+      // After flattening, each monomial in P_j is:
+      //   real_coeff(params) * exp(sum_i complex_alpha_i * log_y[i])
+      // where real_coeff depends on kinematic params and complex_alpha_i = e_i / a_i.
+      // Since the coefficients are real but the exponents are complex,
+      // each monomial is complex and P_j is a sum of complex numbers.
+
+      cx P0(0.0, 0.0);
+      P0 += real_coeff_00(params) * std::exp(cx(re_00, im_00) * log_y[0] + cx(re_01, im_01) * log_y[1] + ...);
+      P0 += real_coeff_01(params) * std::exp(...);
+      // ... more monomials
+
+      // --- Compute Prod_j P_j^{B_j} ---
+      cx result = prefactor;
+      result *= std::exp(B0 * std::log(P0));
+      result *= std::exp(B1 * std::log(P1));
+
+      return result;
+  }
+
+For type (b) integrands (G_1): same structure, multiply by log_y[i] or std::log(P_j).real() where needed.
+
+For type (c) integrands (finite remainder): evaluate TWO polynomial products and take their difference, multiply by y_k^{a_k(0)-1}:
+
+  inline cx remainder_s(const double* y, const double* params) {
+      double log_y[n];
+      for (int i = 0; i < n; i++)
+          log_y[i] = (y[i] > 1e-300) ? std::log(y[i]) : -700.0;
+
+      cx full_prod = evaluate_full(y, log_y, params);
+      cx simp_prod = evaluate_simplified(y, log_y, params);
+      cx yk_factor = std::exp(cx(re_ak_minus_1, im_ak_minus_1) * log_y[k]);
+
+      return prefactor * yk_factor * (full_prod - simp_prod);
+  }
+
+--- Runtime checks in C++ (compile-time controlled) ---
+Generate the C++ code with a #define TROPICAL_MC_DEBUG flag. When enabled, the following checks run during Monte Carlo:
+
+  (a) NaN/Inf detection: after every integrand evaluation, check std::isfinite(val.real()) && std::isfinite(val.imag()). If a NaN or Inf is detected, print the y-values and params to stderr and skip this sample (do not accumulate it). Count the number of skipped samples and report at the end. If more than 0.1% of samples are skipped, print a warning.
+
+  (b) Magnitude monitoring: track the maximum |integrand| seen across all samples for each sector. At the end, print a summary for each sector: mean, stddev, max. If max / mean > 1000, print a warning that the integrand has large fluctuations in this sector, suggesting the tropical decomposition may not be adequately resolving hierarchies.
+
+  (c) Polynomial positivity check (for convergent sectors only): before raising P_j to the power B_j, check that P_j.real() > 0 and |P_j.imag()| / P_j.real() < 0.01 (i.e., the polynomial is nearly real positive as expected). If violated, print a warning with the y-values. This catches errors in the monomial exponent transformation. NOTE: after the flattening with complex exponents, the individual monomials are complex, so the polynomial evaluated at transformed variables is generically complex. This check should therefore only be applied BEFORE flattening (i.e., to a separate debug integrand that evaluates the polynomial at the un-flattened y-values). Alternatively, skip this check and rely on the Mathematica-side checks.
+
+  (d) Convergence check: for the first kinematic point, run the Monte Carlo in batches (e.g., 10 batches of N/10 samples) and verify that the running estimate stabilizes. Print the estimate after each batch. If the final two batches differ by more than 3 sigma, print a warning.
+
+When TROPICAL_MC_DEBUG is not defined, all these checks are compiled out for maximum performance.
+
+--- Monte Carlo integration ---
+For each kinematic point and each integrand, estimate:
+  I_s = (1/N) * Sum_{k=1}^{N} f_s(y^{(k)}, params)
+with y^{(k)} uniform on [0,1]^dim. Track running mean and variance of Re and Im using Welford's online algorithm.
+
+Parallelization:
+  #pragma omp parallel for schedule(dynamic)
+  for (int kp = 0; kp < N_kinematic_points; kp++) {
+      double* params = kinematic_data[kp];
+      std::mt19937_64 rng(seed_base + kp);
+      std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+      double total_re = 0.0, total_im = 0.0;
+      double total_var_re = 0.0, total_var_im = 0.0;
+
+      for (int s = 0; s < N_integrands; s++) {
+          int dim = integrand_dim[s];
+          double mean_re = 0.0, mean_im = 0.0;
+          double M2_re = 0.0, M2_im = 0.0;
+
+          for (int k = 0; k < N_samples; k++) {
+              double y[MAX_DIM];
+              for (int i = 0; i < dim; i++) y[i] = dist(rng);
+
+              cx val = integrand_table[s](y, params);
+
+              #ifdef TROPICAL_MC_DEBUG
+              if (!std::isfinite(val.real()) || !std::isfinite(val.imag())) {
+                  // log and skip
+                  continue;
+              }
+              #endif
+
+              double d_re = val.real() - mean_re;
+              mean_re += d_re / (k + 1);
+              M2_re += d_re * (val.real() - mean_re);
+              double d_im = val.imag() - mean_im;
+              mean_im += d_im / (k + 1);
+              M2_im += d_im * (val.imag() - mean_im);
+          }
+
+          total_re += mean_re;
+          total_im += mean_im;
+          total_var_re += M2_re / ((double)N_samples * (N_samples - 1));
+          total_var_im += M2_im / ((double)N_samples * (N_samples - 1));
+      }
+
+      results[kp] = {total_re, total_im,
+                     std::sqrt(total_var_re), std::sqrt(total_var_im)};
+  }
+
+Use a function pointer array to dispatch integrand functions (different dimensions possible).
+
+I/O:
+  Input: 7200 kinematic points from text file, one row per point.
+  Output: one row per kinematic point: Re(I) Im(I) Re_err Im_err
+  Command-line args: input file, output file, N_samples (default 10^6), N_threads.
+
+Compilation:
+  Debug:   g++ -std=c++17 -O2 -fopenmp -DTROPICAL_MC_DEBUG -o tropical_mc_dbg generated_code.cpp -lm
+  Release: g++ -std=c++17 -O3 -fopenmp -o tropical_mc generated_code.cpp -lm
+
+CHECKS in the code generator (Mathematica side, Module 3):
+  (a) Before writing the C++ file, verify that all integrand expressions are syntactically valid: run CForm on each expression and check it contains no unresolved Mathematica symbols (e.g., no leftover Sin, Cos, Sqrt that were not converted).
+  (b) Count the number of integrand functions generated and print a summary: "Generated N_convergent convergent sectors, N_G0 G_0 integrands, N_G1 G_1 integrands, N_remainder remainder integrands, total N_total integrand functions."
+  (c) Verify the generated C++ compiles without errors or warnings before proceeding to run it. If compilation fails, return the compiler error output to the user.
+  (d) Verify the generated file has the expected structure: grep for the function signatures, the main loop, and the I/O code.
+
+Code generation in Mathematica:
+Write a helper MmaToC[expr] that converts Mathematica expressions to C++ strings:
+  - CForm as starting point, post-process:
+      * Power(x, n) -> pow(x, (double)(n)) or std::pow for complex
+      * Integer divisions -> double divisions (1/3 -> 1.0/3.0)
+      * Complex constants a + b*I -> cx(a, b)
+  - Complex exponents alpha_{m,i} known at code-gen time: emit as literal cx constants.
+  - Real polynomial coefficients depend on params: emit as arithmetic in params[0], params[1], etc.
+  - Precompute log_y[i] once per integrand evaluation.
+
+
+MODULE 4: MATHEMATICA DRIVER AND RESULT ASSEMBLY
+--------------------------------------------------
+Write EvaluateTropicalMC:
+
+1. Input:
+   - Integrand specification (polynomials, exponents, variables, kinematic symbols)
+   - Tropical fan data, obtained by calling the appropriate function from tropical_fan.wl
+   - 7200 kinematic parameter values
+   - Convergent or divergent flag
+   - Options: N_samples (default 10^6), N_threads, file paths, runChecks (default True)
+
+2. Call ProcessSector (Module 1) for each cone.
+
+3. If runChecks: run ValidateDecomposition on a small number of test kinematic points (e.g., the first 3). Abort if relative error exceeds tolerance.
+
+4. If divergent: run Module 2 symbolically. Compute analytic pole contributions.
+
+5. If runChecks and divergent: run ValidateSubtraction on test kinematic points. Abort if self-consistency check fails.
+
+6. Evaluate the analytic pole contributions at all 7200 kinematic points in Mathematica.
+
+7. Call GenerateCppMonteCarlo (Module 3) to write C++ source.
+
+8. If runChecks: compile in debug mode first and run on the first 5 kinematic points. Inspect debug output for NaN warnings, magnitude warnings, and convergence behavior. If clean, recompile in release mode.
+
+9. Write kinematic data to text file.
+
+10. Compile (release mode) and run C++ via RunProcess. Check return code and stderr.
+
+11. Read C++ output. Combine with analytic pole contributions from step 6.
+
+12. If runChecks: compare C++ results for the first few kinematic points against NIntegrate (both the sector sum and the full un-decomposed integral). Report relative errors.
+
+13. Return: list of {kinematic point, Re[I], Im[I], Re_err, Im_err}.
+
+CHECKS in the driver:
+  (a) Verify the kinematic data has the expected dimensions (N_points x N_params).
+  (b) Verify all kinematic parameter values are real and finite.
+  (c) Verify the C++ output file has exactly 7200 rows and 4 columns.
+  (d) Verify all output values are finite (no NaN or Inf in the results).
+  (e) Print a summary of the Monte Carlo errors: mean, median, max of Re_err and Im_err across all kinematic points. Flag any kinematic points where the error exceeds 10% of the result magnitude.
+
+
+MODULE 5: VALIDATION
+---------------------
+
+Test 1 (Convergent, 2D, real exponents):
+  Integral[0,Inf] dx1 dx2 / (1 + 2 x1^2 + x2^2 + x1 x2^2 + 3 x1^2 x2)^A
+  A = 2, 3. Compare MC against NIntegrate to ~1%.
+
+Test 2 (Convergent, 2D, complex exponents):
+  Same integral, A = 2 + 0.5 I. Verify Re and Im against NIntegrate.
+
+Test 3 (Divergent, 1D):
+  f(eps) = Integral[0,1] dy y^{2 eps - 1} / (1 + y^2)
+  Exact: 1/(2 eps) - log(2)/2. Verify both terms.
+
+Test 4 (Divergent, 2D):
+  g(eps) = Integral[0,1] dy1 dy2 y2^{2 eps - 1} y1^{2 eps} / (1 + y1 + y2 + y1 y2^2 + y1^3 y2^2)^2
+  Cross-check against direct evaluation at small nonzero epsilon.
+
+Test 5 (End-to-end kinematic scan):
+  Integral[0,Inf] dx1 dx2 / (1 + lam x1^2 + x2^2 + x1 x2^2)^{2 + 0.5I}
+  100 values of lam in [0.1, 10] via full C++ pipeline. Compare against NIntegrate.
+
+For EACH test, print a structured report:
+  - Test name and description
+  - Expected result (analytic or NIntegrate reference)
+  - Computed result (MC)
+  - Absolute and relative error
+  - PASS/FAIL (fail if relative error > 2% for convergent, or if pole/finite coefficients disagree by > 5% for divergent)
+  - For divergent tests: separately report the pole coefficient, finite part, and remainder, each with their own PASS/FAIL.
+
+Implement all tests in a function RunAllTests[] that can be called independently.
+
+
+GENERAL INSTRUCTIONS
+--------------------
+- READ tropical_fan.wl FIRST. Understand and match its conventions exactly.
+- Write all new Mathematica code in a separate package (tropical_eval.wl) that loads tropical_fan.wl.
+- C++ code: C++17, compiles with -Wall -Wextra -O3 -fopenmp.
+- double for reals, std::complex<double> (aliased cx) for complex quantities.
+- Handle y[i] = 0: floor log(y[i]) at -700.0 to avoid -inf.
+- Comment all generated C++ code.
+- Every function should have a corresponding check or test. The philosophy is: each transformation (coordinate change, flattening, subtraction, code generation) can introduce errors, and the only way to catch them is to verify the output of each step independently before proceeding to the next.
