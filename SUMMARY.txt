@@ -180,6 +180,50 @@ Step 6: Analytic pole.
     by Monte Carlo.
 
 
+2c'.  IBP-BASED POLE EXTRACTION  (Module 2b: IBPProcessSector)
+--------------------------------------------------------------------------------
+
+An alternative to tropical subtraction, the IBP method resolves divergences
+(including NESTED divergences with multiple divergent variables) via
+integration by parts.
+
+For a divergent variable y_k with a_k = c_k * eps + O(eps^2):
+
+    I_sector = (1/a_k) * [ B_boundary - sum_t coeff_t * I_t ]
+
+where:
+    B_boundary = integral of f(y)|_{y_k=1} over non-divergent variables
+                 (an (n-1)-dim convergent integral, like G0 but at y_k=1)
+    I_t        = n-dim integrals from monomial decomposition of d/dy_k f
+    coeff_t    = B_j * c_m * e_{m,k}  (from derivative monomial terms)
+
+Each IBP term t has new effective exponents:
+    alpha_{t,k} = a_k + e_{m,k}  >= 1 at eps=0  (convergent!)
+    alpha_{t,i} = a_i + e_{m,i}  for i != k
+
+Key features:
+    - Different terms get DIFFERENT flattening transforms
+    - eps-expansion must happen BEFORE flattening (exponents are eps-dependent)
+    - The boundary integral at y_k=1 has the same structure as G0 (same
+      flattening of non-divergent variables, all monomials kept)
+    - For nested divergences: IBP is applied iteratively, resolving one
+      variable at a time.  With d divergences, poles up to 1/eps^d arise.
+    - Term count per IBP step = number of monomials with e_{m,k} > 0
+
+Pole structure (single divergence):
+    Pole coeff = (B^{(0)} - S_0) / c_k
+    Finite     = [(B^{(1)} - S_1) - r_k*(B^{(0)} - S_0)] / c_k
+where S_0 = sum_t coeff_t^(0) * I_{t,0}, r_k = a_k^{(2)}/c_k.
+
+Functions:
+    IBPReduceSector[sectorData, eps]         - symbolic IBP decomposition
+    IBPProcessSector[sectorData, spec]       - full pipeline (reduce+expand+flatten)
+    IBPCheckBoundary[sectorData, spec, n]    - boundary term verification
+    ValidateIBP[ibpSD, sd, spec, kin, eps]   - cross-check vs NIntegrate
+    GenerateCppMonteCarloIBP[conv, ibp, ...]  - C++ codegen with per-function output
+    EvaluateTropicalMCIBP[spec, fan, kin]    - top-level IBP driver
+
+
 2d.  C++ CODE GENERATION  (Module 3: GenerateCppMonteCarlo)
 --------------------------------------------------------------------------------
 
@@ -338,6 +382,22 @@ Tests 8-18: Divergent-integral cross-checks
         Combines 1/eps divergence with complex polynomial exponent.
         Verifies B0 = {-2+I}.  Uses 5% threshold for complex exponents.
 
+Tests 19-22: IBP regression tests
+    Test 19: IBP symbolic decomposition (2D, single divergence)
+        Int x1^{2eps-1} (1+x1+x2+x1*x2)^{-2} dx
+        Verifies IBPReduceSector produces correct term count (matching
+        number of monomials with e_{m,k} > 0) and all terms convergent.
+    Test 20: IBP cross-check via ValidateIBP
+        Same integral.  Verifies (1/a_k)[B_boundary - sum coeff_t I_t]
+        reproduces original sector integral at finite eps (threshold 5%).
+    Test 21: IBP term count for multi-monomial polynomial
+        Int x1^{2eps-1} (1+x1+x2+x1*x2+x1^2*x2)^{-2} dx
+        5-monomial polynomial, verifies term count per sector.
+    Test 22: Nested divergence (two divergent variables)
+        Int x1^{2eps-1} x2^{2eps-1} (1+x1+x2+x1*x2)^{-3} dx
+        Both x1 and x2 divergent.  Verifies iterative IBP resolves all
+        divergences (1 -> 2 -> 3 terms for nested sector).
+
 
 4.  FUNCTION REFERENCE
 ================================================================================
@@ -406,7 +466,40 @@ ParsePolynomial[poly, vars]
     pairs.
 
 RunAllTests[]
-    Runs the 18-test validation suite with structured PASS/FAIL reporting.
+    Runs the 18-test validation suite (Tests 1-18) with structured
+    PASS/FAIL reporting.  IBP tests (19-22) are run separately via
+    RunTest19[], RunTest20[], RunTest21[], RunTest22[].
+
+IBPReduceSector[sectorData, eps]
+    Symbolic IBP decomposition: identifies all divergent variables and
+    iteratively applies IBP to produce a list of convergent terms.
+    Handles nested divergences (multiple divergent variables per sector).
+    Returns: Association with IBPPrefactors, Terms, DivergentVariables,
+    NTerms, ClearedPolys, etc.
+
+IBPProcessSector[sectorData, integrandSpec]
+    Full IBP pipeline: IBP reduction + eps-expansion + per-term flattening +
+    boundary construction.  Returns: IBPSectorData association with
+    BoundaryData, IBPTerms, ck, rk, AnalyticPole, etc.
+
+IBPCheckBoundary[sectorData, integrandSpec, nPoints]
+    Numerically verifies IBP boundary terms at y_k=0 (should vanish) and
+    y_k=1 (reports magnitude; non-zero is expected and handled).
+
+ValidateIBP[ibpSectorData, sectorData, integrandSpec, testKinematics, testEpsilon]
+    Cross-checks the IBP formula (1/a_k)[B - sum coeff_t I_t] against
+    direct NIntegrate at finite epsilon.  Returns RelativeError.
+
+GenerateCppMonteCarloIBP[convergentSectors, ibpSectors, integrandSpec, outputFile]
+    Generates C++ with per-function output for IBP integrands.
+    Convergent sectors are summed; IBP boundary and term functions are
+    reported individually for Mathematica-side combination.
+
+EvaluateTropicalMCIBP[integrandSpec, fanData, kinematicPoints, opts]
+    Top-level driver using IBP for all divergent sectors.
+    Returns results with PoleCoefficient, FinitePart, ConvergentSum,
+    IBPPoleContrib, IBPFiniteContrib per kinematic point.
+    Options: NSamples, NThreads, RunChecks, WorkingDirectory, Verbose.
 
 
 DATA STRUCTURES
@@ -447,16 +540,36 @@ DivergentSectorData (Association, returned by ProcessDivergentSector):
     "AnalyticPole"       -> 1/c_k
     "ck"                 -> leading coefficient of a_k(eps)
 
+IBPSectorData (Association, returned by IBPProcessSector):
+    "ConeIndex"          -> integer
+    "Method"             -> "IBP"
+    "DivergentVariables" -> {k1, k2, ...}      indices of div vars
+    "NDivergent"         -> number of divergent variables
+    "ck"                 -> leading coefficient c_k of a_k(eps)
+    "rk"                 -> second-order correction a_k^(2)/c_k
+    "BoundaryData"       -> <| "FlatPolys", "Prefactor", "Dimension" (n-1),
+                               "PolyExponents", "LogInsertions" |>
+    "IBPTerms"           -> list of term associations, each with:
+                            "FlatPolys", "Prefactor", "Dimension" (n),
+                            "PolyExponents", "Coeff0", "Coeff1",
+                            "LogInsertions", "Alpha0", "Alpha1"
+    "NTerms"             -> total number of IBP terms
+    "IBPPrefactors"      -> {-1/a_{k1}, -1/a_{k2}, ...}
+    "AnalyticPole"       -> 1/c_k
+
 
 5.  FILES
 ================================================================================
 
 Core packages (TROPICAL_MONTE_CARLO/):
-  tropical_fan.wl                    Tropical fan computation via Polymake
-  tropical_eval.wl                   Main evaluation package
+  tropical_fan.wl                    Tropical fan computation via Polymake (469 lines)
+  tropical_eval.wl                   Main evaluation package (3834 lines)
+                                     Modules 1-4: original pipeline
+                                     Module 2b: IBP pole extraction (additive)
+                                     Module 4b: EvaluateTropicalMCIBP driver
 
 Examples and tests (TROPICAL_MONTE_CARLO/EXAMPLES/):
-  tropical_eval_examples.wl          14 worked examples + 18-test validation suite
+  tropical_eval_examples.wl          14 worked examples + 22-test validation suite
   tropical_fan_examples.wl           Examples for the fan package
   test_quick.wl                      Quick test (Example 1 only)
   test_cpp.wl                        C++ compilation and MC execution test

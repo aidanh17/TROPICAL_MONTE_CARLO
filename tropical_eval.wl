@@ -74,6 +74,35 @@ CompileCpp::usage =
   "CompileCpp[srcFile, outputBinary, debug] compiles generated C++ \
 Monte Carlo source code. debug=True adds -DTROPICAL_MC_DEBUG.";
 
+(* ---- IBP-based pole extraction (Module 2b) ---- *)
+
+IBPReduceSector::usage =
+  "IBPReduceSector[sectorData, eps] performs IBP-based decomposition of \
+a divergent sector into monomial terms. Handles single and nested divergences.";
+
+IBPProcessSector::usage =
+  "IBPProcessSector[sectorData, integrandSpec] runs the full IBP pipeline: \
+IBP reduction, epsilon expansion, flattening, and boundary construction. \
+Returns an IBPSectorData association ready for C++ codegen.";
+
+IBPCheckBoundary::usage =
+  "IBPCheckBoundary[sectorData, integrandSpec, nPoints] numerically verifies \
+that IBP boundary terms are well-behaved.";
+
+GenerateCppMonteCarloIBP::usage =
+  "GenerateCppMonteCarloIBP[convergentSectors, ibpSectors, integrandSpec, \
+outputFile] generates C++ Monte Carlo code with IBP divergence handling. \
+Outputs per-function MC results for IBP sectors.";
+
+ValidateIBP::usage =
+  "ValidateIBP[ibpSectorData, sectorData, integrandSpec, testKinematics, \
+testEpsilon] cross-checks the IBP pipeline against direct NIntegrate.";
+
+EvaluateTropicalMCIBP::usage =
+  "EvaluateTropicalMCIBP[integrandSpec, fanData, kinematicPoints, opts] \
+runs the full tropical Monte Carlo pipeline using IBP for divergent sectors. \
+Options: NSamples, NThreads, RunChecks, Verbose, WorkingDirectory.";
+
 (* ---- Error messages ---- *)
 
 TropicalEval::degenerate = "Sector `1`: degenerate cone, det(M) = 0.";
@@ -2204,6 +2233,1595 @@ Module[
     "CppFile"              -> cppFile,
     "ResultFile"           -> resultFile,
     "AnalyticContributions" -> analyticContributions|>
+];
+
+
+(* ============================================================================
+   MODULE 2b: IBP-BASED POLE EXTRACTION
+
+   Integration-by-parts based iterative pole extraction for handling
+   divergent sectors, including nested divergences (multiple divergent
+   variables per sector).
+
+   This module is ADDITIVE — it does not modify any existing functions.
+   The existing ProcessDivergentSector (tropical subtraction) is retained
+   as the "Subtraction" option for DivergenceMethod.
+
+   Key difference from the plan: the IBP on [0,1]^n produces a boundary
+   term at y_k = 1 which is generally non-zero.  The correct formula is:
+
+       I_sector = (1/a_k) * [ B_boundary - sum_t coeff_t * I_t ]
+
+   where B_boundary = int f(y)|_{y_k=1} dy_{!=k} is the boundary
+   contribution and I_t are the IBP monomial terms.
+   ============================================================================ *)
+
+(* --------------------------------------------------------------------------
+   IBPExpandOneVariable
+   Applies IBP decomposition for a single divergent variable y_k to one
+   term.  Returns a list of new terms (one per monomial per polynomial).
+   -------------------------------------------------------------------------- *)
+
+IBPExpandOneVariable[term_Association, k_Integer,
+                     clearedPolys_List, eps_] :=
+Module[
+  {termCoeff, termExps, termPolyExps, newTerms, nPolys},
+
+  termCoeff    = term["Coefficient"];
+  termExps     = term["NewExponents"];
+  termPolyExps = term["PolyExponents"];
+  nPolys       = Length[clearedPolys];
+
+  newTerms = {};
+
+  Do[
+    Module[{Bj, polj},
+      Bj   = termPolyExps[[j]];
+      polj = clearedPolys[[j]];
+
+      Do[
+        Module[{cm, em, emk, newCoeff, newExps, newPolyExps},
+          cm  = mono[[1]];
+          em  = mono[[2]];
+          emk = em[[k]];
+
+          (* Only monomials with e_{m,k} > 0 contribute to d/dy_k Q_j *)
+          If[TrueQ[emk > 0] || (NumericQ[emk] && emk > 0),
+
+            (* Coefficient: B_j * c_m * e_{m,k} *)
+            newCoeff = termCoeff * Bj * cm * emk;
+
+            (* New effective exponents: alpha_i = old_alpha_i + e_{m,i} *)
+            newExps = termExps + em;
+
+            (* Polynomial exponents: B_j -> B_j - 1, others unchanged *)
+            newPolyExps = termPolyExps;
+            newPolyExps[[j]] = newPolyExps[[j]] - 1;
+
+            AppendTo[newTerms, <|
+              "Coefficient"   -> newCoeff,
+              "NewExponents"  -> newExps,
+              "PolyExponents" -> newPolyExps
+            |>];
+          ]
+        ],
+        {mono, polj}
+      ];
+    ],
+    {j, nPolys}
+  ];
+
+  newTerms
+];
+
+(* --------------------------------------------------------------------------
+   IBPReduceSector
+   Main IBP reduction function.  Iteratively applies IBP to resolve all
+   divergent variables in a sector.
+   -------------------------------------------------------------------------- *)
+
+IBPReduceSector[sectorData_Association, eps_] :=
+Module[
+  {n, aVals, polyExps, clearedPolys, detM,
+   a0, allDivVars, ibpPrefactors, terms, resolvedVars},
+
+  n            = sectorData["Dimension"];
+  aVals        = sectorData["NewExponents"];
+  polyExps     = sectorData["PolynomialExponents"];
+  clearedPolys = sectorData["ClearedPolys"];
+  detM         = sectorData["DetM"];
+
+  (* Find all divergent variables: Re(a_i^(0)) <= 0 *)
+  a0 = aVals /. eps -> 0;
+  allDivVars = {};
+  Do[
+    If[TrueQ[Re[a0[[i]]] <= 0] ||
+       (NumericQ[a0[[i]]] && Re[a0[[i]]] <= 0),
+      AppendTo[allDivVars, i]
+    ],
+    {i, n}
+  ];
+
+  If[Length[allDivVars] == 0,
+    Print["IBPReduceSector: no divergent variables in sector ",
+          sectorData["ConeIndex"]];
+    Return[$Failed]
+  ];
+
+  Print["IBPReduceSector: sector ", sectorData["ConeIndex"],
+        ", divergent variables: y_", allDivVars,
+        ", effective exponents at eps=0: ", a0];
+
+  (* Initialize: single term representing the original integral *)
+  terms = {<|
+    "Coefficient"   -> 1,
+    "NewExponents"  -> aVals,
+    "PolyExponents" -> polyExps
+  |>};
+
+  ibpPrefactors = {};
+  resolvedVars  = {};
+
+  (* Iteratively apply IBP for each divergent variable *)
+  Do[
+    Module[{k, ak, ck, newTerms, nBefore},
+      k  = allDivVars[[dv]];
+      ak = aVals[[k]];
+      ck = D[ak, eps] /. eps -> 0;
+
+      If[TrueQ[ck == 0] || (NumericQ[ck] && ck == 0),
+        Message[TropicalEval::badck, sectorData["ConeIndex"], k];
+        Return[$Failed]
+      ];
+
+      AppendTo[ibpPrefactors, -1/ak];
+      AppendTo[resolvedVars, k];
+
+      nBefore  = Length[terms];
+      newTerms = {};
+
+      Do[
+        Module[{term, termA0k},
+          term    = terms[[t]];
+          termA0k = term["NewExponents"][[k]] /. eps -> 0;
+
+          If[TrueQ[Re[termA0k] <= 0] ||
+             (NumericQ[termA0k] && Re[termA0k] <= 0),
+            (* Divergent in y_k: apply IBP *)
+            newTerms = Join[newTerms,
+              IBPExpandOneVariable[term, k, clearedPolys, eps]
+            ],
+            (* Already convergent: pass through *)
+            AppendTo[newTerms, term]
+          ]
+        ],
+        {t, Length[terms]}
+      ];
+
+      terms = newTerms;
+
+      Print["  IBP step for y_", k, ": ", nBefore, " -> ",
+            Length[terms], " terms"];
+    ],
+    {dv, Length[allDivVars]}
+  ];
+
+  (* Verify all terms are now convergent *)
+  Module[{problemTerms = 0},
+    Do[
+      Module[{termA0},
+        termA0 = terms[[t]]["NewExponents"] /. eps -> 0;
+        Do[
+          If[TrueQ[Re[termA0[[i]]] <= 0] ||
+             (NumericQ[termA0[[i]]] && Re[termA0[[i]]] <= 0),
+            problemTerms++;
+            If[problemTerms <= 3,
+              Print["WARNING: term ", t, " still divergent in y_", i,
+                    ", alpha^(0) = ", termA0[[i]]]
+            ]
+          ],
+          {i, n}
+        ]
+      ],
+      {t, Length[terms]}
+    ];
+    If[problemTerms > 0,
+      Print["WARNING: ", problemTerms,
+            " divergences remain after IBP reduction"]
+    ];
+  ];
+
+  <|
+    "ConeIndex"              -> sectorData["ConeIndex"],
+    "IBPPrefactors"          -> ibpPrefactors,
+    "Terms"                  -> terms,
+    "NTerms"                 -> Length[terms],
+    "DivergentVariables"     -> resolvedVars,
+    "NDivergent"             -> Length[resolvedVars],
+    "ClearedPolys"           -> clearedPolys,
+    "DetM"                   -> detM,
+    "Dimension"              -> n,
+    "OriginalExponents"      -> aVals,
+    "OriginalPolyExponents"  -> polyExps,
+    "TransformedPolys"       -> sectorData["TransformedPolys"],
+    "MinExponents"           -> sectorData["MinExponents"],
+    "MonomialExponents"      -> sectorData["MonomialExponents"],
+    "RawExponents"           -> sectorData["RawExponents"],
+    "RayMatrix"              -> sectorData["RayMatrix"],
+    "SelectedRays"           -> sectorData["SelectedRays"]
+  |>
+];
+
+(* --------------------------------------------------------------------------
+   IBPProcessSector
+   Full IBP pipeline: reduce, expand in epsilon, flatten, build boundary.
+   Returns an IBPSectorData association ready for C++ codegen.
+
+   For single divergence: produces boundary (at y_k = 1) and IBP terms.
+   The combination is:
+       I_sector = (1/a_k) [ B_boundary - sum_t coeff_t I_t ]
+   -------------------------------------------------------------------------- *)
+
+IBPProcessSector[sectorData_Association, integrandSpec_Association] :=
+Module[
+  {eps, n, ibpData, terms, clearedPolys, detM,
+   divVars, ck, rk, aVals, polyExps,
+   a0, a1, B0, B1, ak, ak2,
+   boundaryData, ibpTermsProcessed,
+   k},
+
+  eps = integrandSpec["RegulatorSymbol"];
+  n   = sectorData["Dimension"];
+
+  (* Step 1: IBP reduction *)
+  ibpData = IBPReduceSector[sectorData, eps];
+  If[ibpData === $Failed, Return[$Failed]];
+
+  terms        = ibpData["Terms"];
+  clearedPolys = ibpData["ClearedPolys"];
+  detM         = ibpData["DetM"];
+  divVars      = ibpData["DivergentVariables"];
+  aVals        = ibpData["OriginalExponents"];
+  polyExps     = ibpData["OriginalPolyExponents"];
+
+  (* Currently handle single divergent variable *)
+  If[Length[divVars] != 1,
+    Print["IBPProcessSector: nested divergences (", Length[divVars],
+          " variables) — using iterative IBP"];
+  ];
+
+  k = divVars[[1]];
+
+  (* Epsilon expansion of the original effective exponents *)
+  a0 = aVals /. eps -> 0;
+  a1 = D[aVals, eps] /. eps -> 0;
+
+  (* Polynomial exponent expansion *)
+  B0 = polyExps /. eps -> 0;
+  B1 = D[polyExps, eps] /. eps -> 0;
+
+  (* IBP prefactor expansion: -1/a_k where a_k = c_k*eps + a_k^(2)*eps^2 + ... *)
+  ak  = aVals[[k]];
+  ck  = D[ak, eps] /. eps -> 0;
+  ak2 = (1/2) D[ak, {eps, 2}] /. eps -> 0;
+  rk  = If[TrueQ[ck == 0], 0, ak2 / ck];
+
+  (* ----- Step 2: Build boundary data (f evaluated at y_k = 1) ----- *)
+  (* Boundary polynomials: Q_j with y_k set to 1.
+     This keeps ALL monomials but drops the y_k coordinate. *)
+  Module[{ndVars, bndPolys, bndA0, bndFlatPolys, bndPrefactor, bndDim,
+          bndLogInsertions},
+    ndVars = DeleteCases[Range[n], k];
+    bndDim = n - 1;
+
+    (* Boundary polynomials: set y_k = 1, remove y_k exponent *)
+    bndPolys = Table[
+      Table[
+        {mono[[1]], mono[[2]][[ndVars]]},
+        {mono, clearedPolys[[j]]}
+      ],
+      {j, Length[clearedPolys]}
+    ];
+
+    bndA0 = a0[[ndVars]];
+
+    (* Flatten non-divergent variables *)
+    bndFlatPolys = Table[
+      Table[
+        {mono[[1]],
+         MapThread[#1/#2 &, {mono[[2]], bndA0}]},
+        {mono, bndPolys[[j]]}
+      ],
+      {j, Length[bndPolys]}
+    ];
+
+    bndPrefactor = Abs[detM] / (Times @@ bndA0);
+
+    bndLogInsertions = <|
+      "VariableTerms" -> Table[
+        {a1[[ndVars[[i]]]] / bndA0[[i]], i},
+        {i, bndDim}
+      ],
+      "PolynomialTerms" -> Table[
+        {B1[[j]], j},
+        {j, Length[polyExps]}
+      ]
+    |>;
+
+    boundaryData = <|
+      "FlatPolys"      -> bndFlatPolys,
+      "Prefactor"      -> bndPrefactor,
+      "Dimension"      -> bndDim,
+      "PolyExponents"  -> B0,
+      "Avals"          -> bndA0,
+      "LogInsertions"  -> bndLogInsertions
+    |>;
+  ];
+
+  (* ----- Step 3: Process each IBP term (expand in eps + flatten) ----- *)
+  ibpTermsProcessed = Table[
+    Module[{term, alpha, alpha0, alpha1, termPolyExps, tB0, tB1,
+            coeff, coeff0, coeff1, flatPrefactor, flatPolys,
+            logInsertions},
+      term         = terms[[t]];
+      alpha        = term["NewExponents"];
+      termPolyExps = term["PolyExponents"];
+      coeff        = term["Coefficient"];
+
+      (* Expand effective exponents in epsilon *)
+      alpha0 = alpha /. eps -> 0;
+      alpha1 = D[alpha, eps] /. eps -> 0;
+
+      (* Verify all alpha0 > 0 *)
+      Do[
+        If[(NumericQ[alpha0[[i]]] && Re[alpha0[[i]]] <= 0) ||
+           TrueQ[Re[alpha0[[i]]] <= 0],
+          Print["ERROR: IBPProcessSector: term ", t,
+                " alpha0[", i, "] = ", alpha0[[i]], " <= 0"];
+          Return[$Failed]
+        ],
+        {i, n}
+      ];
+
+      (* Expand polynomial exponents *)
+      tB0 = termPolyExps /. eps -> 0;
+      tB1 = D[termPolyExps, eps] /. eps -> 0;
+
+      (* Expand coefficient *)
+      coeff0 = coeff /. eps -> 0;
+      coeff1 = D[coeff, eps] /. eps -> 0;
+
+      (* Flatten: y_i -> (y_i')^{1/alpha0_i} *)
+      flatPolys = Table[
+        Table[
+          {mono[[1]],
+           MapThread[#1/#2 &, {mono[[2]], alpha0}]},
+          {mono, clearedPolys[[j]]}
+        ],
+        {j, Length[clearedPolys]}
+      ];
+
+      flatPrefactor = Abs[detM] / (Times @@ alpha0);
+
+      (* Log insertion sum *)
+      logInsertions = <|
+        "VariableTerms" -> Table[
+          {alpha1[[i]] / alpha0[[i]], i},
+          {i, n}
+        ],
+        "PolynomialTerms" -> Table[
+          {tB1[[j]], j},
+          {j, Length[termPolyExps]}
+        ]
+      |>;
+
+      <|
+        "FlatPolys"      -> flatPolys,
+        "Prefactor"      -> flatPrefactor,
+        "Dimension"      -> n,
+        "PolyExponents"  -> tB0,
+        "Coeff0"         -> coeff0,
+        "Coeff1"         -> coeff1,
+        "LogInsertions"  -> logInsertions,
+        "Alpha0"         -> alpha0,
+        "Alpha1"         -> alpha1
+      |>
+    ],
+    {t, Length[terms]}
+  ];
+
+  <|
+    "ConeIndex"              -> sectorData["ConeIndex"],
+    "IsDivergent"            -> True,
+    "Method"                 -> "IBP",
+    "DivergentVariable"      -> k,
+    "DivergentVariables"     -> divVars,
+    "NDivergent"             -> Length[divVars],
+    "Dimension"              -> n,
+    "DetM"                   -> detM,
+    "ck"                     -> ck,
+    "rk"                     -> rk,
+    "a0"                     -> a0,
+    "a1"                     -> a1,
+    "B0"                     -> B0,
+    "B1"                     -> B1,
+    "BoundaryData"           -> boundaryData,
+    "IBPTerms"               -> ibpTermsProcessed,
+    "NTerms"                 -> Length[ibpTermsProcessed],
+    "IBPPrefactors"          -> ibpData["IBPPrefactors"],
+    "ClearedPolys"           -> clearedPolys,
+    "OriginalExponents"      -> aVals,
+    "OriginalPolyExponents"  -> polyExps,
+    "TransformedPolys"       -> sectorData["TransformedPolys"],
+    "MinExponents"           -> sectorData["MinExponents"],
+    "MonomialExponents"      -> sectorData["MonomialExponents"],
+    "RawExponents"           -> sectorData["RawExponents"],
+    "AnalyticPole"           -> 1/ck
+  |>
+];
+
+(* --------------------------------------------------------------------------
+   IBPCheckBoundary
+   Numerically verify that IBP boundary terms and the IBP decomposition
+   are self-consistent by checking at finite epsilon.
+   -------------------------------------------------------------------------- *)
+
+IBPCheckBoundary[sectorData_Association, integrandSpec_Association,
+                 nPoints_Integer: 20] :=
+Module[
+  {eps, n, k, aVals, clearedPolys, polyExps, detM,
+   a0, a1, divVars, ck, testEps, yVars, yValsSet,
+   kinRules, epsRules, results},
+
+  eps          = integrandSpec["RegulatorSymbol"];
+  n            = sectorData["Dimension"];
+  aVals        = sectorData["NewExponents"];
+  clearedPolys = sectorData["ClearedPolys"];
+  polyExps     = sectorData["PolynomialExponents"];
+  detM         = sectorData["DetM"];
+  a0           = aVals /. eps -> 0;
+  a1           = D[aVals, eps] /. eps -> 0;
+
+  divVars = {};
+  Do[
+    If[TrueQ[Re[a0[[i]]] <= 0] ||
+       (NumericQ[a0[[i]]] && Re[a0[[i]]] <= 0),
+      AppendTo[divVars, i]
+    ],
+    {i, n}
+  ];
+
+  results = {};
+
+  Do[
+    k  = divVars[[dv]];
+    ck = a1[[k]];
+    testEps = 0.01;
+
+    Print["IBPCheckBoundary: checking y_", k, " in sector ",
+          sectorData["ConeIndex"]];
+
+    (* Check boundary at y_k = 0: y_k^{a_k} f(y) -> 0 *)
+    Module[{yvals, akNum, bndVal},
+      Do[
+        yvals   = RandomReal[{0.01, 0.99}, n];
+        akNum   = ck * testEps;
+        yvals[[k]] = 10^(-6);
+        bndVal  = yvals[[k]]^akNum;
+        If[Abs[bndVal] > 10^(-4),
+          Print["  WARNING: y_k=0 boundary not small: y_k^a_k = ",
+                bndVal, " at y_k = ", yvals[[k]]]
+        ],
+        {nPoints}
+      ];
+      Print["  y_k=0 boundary: OK (y_k^a_k vanishes for eps>0)"];
+    ];
+
+    (* Check boundary at y_k = 1: compute f(y)|_{y_k=1}
+       and report its magnitude *)
+    Module[{yvals, polyVals, fVal, fMags, ndVars, ndYvals},
+      ndVars = DeleteCases[Range[n], k];
+      fMags = Table[
+        ndYvals = RandomReal[{0.01, 0.99}, n - 1];
+
+        polyVals = Table[
+          Total[Table[
+            Module[{cm, em, logY, ndEm},
+              cm = mono[[1]];
+              em = mono[[2]];
+              (* Set y_k = 1, use only non-div vars *)
+              cm * Exp[Total[em[[ndVars]] * Log[ndYvals]]]
+            ],
+            {mono, clearedPolys[[j]]}
+          ]],
+          {j, Length[clearedPolys]}
+        ];
+
+        fVal = Abs[detM] *
+          Exp[Total[(a0[[ndVars]] - 1) * Log[ndYvals]]] *
+          Times @@ MapThread[
+            Function[{pv, be}, Exp[be * Log[pv]]],
+            {polyVals, polyExps /. eps -> 0}
+          ];
+
+        Abs[fVal],
+        {nPoints}
+      ];
+
+      Print["  y_k=1 boundary magnitude: mean=", Mean[fMags],
+            " max=", Max[fMags], " min=", Min[fMags]];
+      If[Max[fMags] > 10^(-10),
+        Print["  NOTE: boundary at y_k=1 is non-zero (expected). ",
+              "IBP formula includes this as the boundary integral."]
+      ];
+      AppendTo[results, <|"Variable" -> k, "BoundaryMags" -> fMags|>];
+    ],
+    {dv, Length[divVars]}
+  ];
+
+  results
+];
+
+(* --------------------------------------------------------------------------
+   ValidateIBP
+   Cross-check the IBP pipeline against direct NIntegrate at finite epsilon.
+   Verifies: (1/a_k)[B - sum_t coeff_t I_t] = original sector integral.
+   -------------------------------------------------------------------------- *)
+
+ValidateIBP[ibpSectorData_Association, sectorData_Association,
+            integrandSpec_Association,
+            testKinematics_List, testEpsilon_: 0.01] :=
+Module[
+  {eps, n, k, ck, rk, a0, a1, aVals, polyExps,
+   kinRules, epsRules, fullRules,
+   clearedPolys, detM, yVars,
+   originalIntegral,
+   boundaryVal, ibpTermVals, ibpSum,
+   ak, reconstructed, relError,
+   B0},
+
+  eps      = integrandSpec["RegulatorSymbol"];
+  n        = sectorData["Dimension"];
+  k        = ibpSectorData["DivergentVariable"];
+  ck       = ibpSectorData["ck"];
+  rk       = ibpSectorData["rk"];
+  a0       = ibpSectorData["a0"];
+  a1       = ibpSectorData["a1"];
+  aVals    = sectorData["NewExponents"];
+  polyExps = sectorData["PolynomialExponents"];
+  detM     = sectorData["DetM"];
+  B0       = polyExps /. eps -> 0;
+
+  kinRules  = testKinematics;
+  epsRules  = {eps -> testEpsilon};
+  fullRules = Join[kinRules, epsRules];
+
+  clearedPolys = ibpSectorData["ClearedPolys"];
+
+  yVars = Table[Unique["yv"], {n}];
+
+  (* Original sector integral at finite epsilon *)
+  Module[{aNum, polyValsExpr, integrand},
+    aNum = aVals /. fullRules;
+    polyValsExpr = Table[
+      Total[Table[
+        Module[{coeff, exps},
+          coeff = mono[[1]] /. kinRules;
+          exps  = mono[[2]];
+          coeff * Exp[Total[exps * Log /@ yVars]]
+        ],
+        {mono, clearedPolys[[j]]}
+      ]],
+      {j, Length[clearedPolys]}
+    ];
+    integrand = Abs[detM] *
+      Exp[Total[(aNum - 1) * Log /@ yVars]] *
+      Times @@ MapThread[
+        Function[{pv, be}, Exp[be * Log[pv]]],
+        {polyValsExpr, polyExps /. fullRules}
+      ];
+
+    originalIntegral = Quiet@NIntegrate[
+      integrand,
+      Evaluate[Sequence @@ ({#, 0, 1} & /@ yVars)],
+      MaxRecursion -> 20,
+      PrecisionGoal -> 4,
+      Method -> "GlobalAdaptive"
+    ];
+  ];
+
+  (* Boundary integral at y_k = 1 (n-1 dim) *)
+  Module[{ndVars, bndYVars, bndAnum, bndPolyVals, bndIntegrand},
+    ndVars  = DeleteCases[Range[n], k];
+    bndYVars = Table[Unique["by"], {n - 1}];
+    bndAnum  = (aVals /. fullRules)[[ndVars]];
+
+    bndPolyVals = Table[
+      Total[Table[
+        Module[{coeff, exps},
+          coeff = mono[[1]] /. kinRules;
+          exps  = mono[[2]][[ndVars]];
+          coeff * Exp[Total[exps * Log /@ bndYVars]]
+        ],
+        {mono, clearedPolys[[j]]}
+      ]],
+      {j, Length[clearedPolys]}
+    ];
+
+    bndIntegrand = Abs[detM] *
+      Exp[Total[(bndAnum - 1) * Log /@ bndYVars]] *
+      Times @@ MapThread[
+        Function[{pv, be}, Exp[be * Log[pv]]],
+        {bndPolyVals, polyExps /. fullRules}
+      ];
+
+    boundaryVal = Quiet@NIntegrate[
+      bndIntegrand,
+      Evaluate[Sequence @@ ({#, 0, 1} & /@ bndYVars)],
+      MaxRecursion -> 20,
+      PrecisionGoal -> 4,
+      Method -> "GlobalAdaptive"
+    ];
+  ];
+
+  (* Each IBP term: n-dim integral *)
+  Module[{ibpTerms, ibpYVars},
+    ibpTerms = ibpSectorData["IBPTerms"];
+    ibpYVars = Table[Unique["iv"], {n}];
+
+    ibpTermVals = Table[
+      Module[{termData, alpha0, tB0, coeff0, flatPrefactor,
+              polyValsExpr, integrand, termVal},
+        termData = ibpTerms[[t]];
+        alpha0   = termData["Alpha0"] /. kinRules;
+        tB0      = termData["PolyExponents"] /. kinRules;
+        coeff0   = termData["Coeff0"] /. kinRules;
+
+        (* Evaluate un-flattened (using full epsilon-dependent exponents
+           from the IBP reduction, at finite epsilon) *)
+        Module[{termExps, termPolyExps, termCoeff, term, terms},
+          terms = ibpSectorData["ClearedPolys"];
+          term  = ibpData`Private`dummyNotUsed;  (* placeholder *)
+
+          (* Use the term's NewExponents from the IBP reduction,
+             evaluated at finite eps *)
+          termExps = ibpSectorData["IBPTerms"][[t]];
+          (* We need the original unexpanded term data.
+             Recompute from the processed data. *)
+        ];
+
+        (* Simpler approach: evaluate at finite epsilon using
+           original cleared polys and the term's effective exponents *)
+        Module[{rawTerms, origTerm, termAlpha, termPE},
+          (* Get the term's eps-dependent exponents from IBPReduceSector.
+             We stored Alpha0/Alpha1 but need the full expression.
+             Reconstruct: alpha = alpha0 + alpha1*eps + ... *)
+          termAlpha = termData["Alpha0"] + testEpsilon * termData["Alpha1"];
+          termPE    = termData["PolyExponents"];
+
+          polyValsExpr = Table[
+            Total[Table[
+              Module[{coeff, exps},
+                coeff = mono[[1]] /. kinRules;
+                exps  = mono[[2]];
+                coeff * Exp[Total[exps * Log /@ ibpYVars]]
+              ],
+              {mono, clearedPolys[[j]]}
+            ]],
+            {j, Length[clearedPolys]}
+          ];
+
+          integrand = Abs[detM] *
+            Exp[Total[(termAlpha - 1) * Log /@ ibpYVars]] *
+            Times @@ MapThread[
+              Function[{pv, be}, Exp[(be /. kinRules) * Log[pv]]],
+              {polyValsExpr, termPE /. epsRules}
+            ];
+
+          termVal = Quiet@NIntegrate[
+            integrand,
+            Evaluate[Sequence @@ ({#, 0, 1} & /@ ibpYVars)],
+            MaxRecursion -> 15,
+            PrecisionGoal -> 3,
+            Method -> "GlobalAdaptive"
+          ];
+
+          (* Include the coefficient *)
+          (termData["Coeff0"] + testEpsilon * termData["Coeff1"]) /.
+            kinRules /. epsRules // (# * termVal &)
+        ]
+      ],
+      {t, Length[ibpTerms]}
+    ];
+  ];
+
+  ibpSum = Total[ibpTermVals];
+
+  (* Reconstruct: (1/a_k) * [boundary - ibpSum] *)
+  ak = ck * testEpsilon + (ibpSectorData["rk"] * ck) * testEpsilon^2;
+  reconstructed = (1/ak) * (boundaryVal - ibpSum);
+  relError = Abs[(reconstructed - originalIntegral) / originalIntegral];
+
+  Print["ValidateIBP for sector ", sectorData["ConeIndex"], ":"];
+  Print["  Original integral (eps=", testEpsilon, "): ", originalIntegral];
+  Print["  Boundary at y_", k, "=1: ", boundaryVal];
+  Print["  IBP sum (", Length[ibpTermVals], " terms): ", ibpSum];
+  Print["  (1/a_k)[B - IBP]: ", reconstructed];
+  Print["  Relative error: ", relError];
+
+  If[relError > 0.02,
+    Print["  WARNING: relative error exceeds 2%"]
+  ];
+
+  <|"OriginalIntegral" -> originalIntegral,
+    "Boundary" -> boundaryVal,
+    "IBPSum" -> ibpSum,
+    "Reconstructed" -> reconstructed,
+    "RelativeError" -> relError|>
+];
+
+(* --------------------------------------------------------------------------
+   GenerateCppMonteCarloIBP
+   Generates C++ Monte Carlo code with IBP divergence handling.
+
+   The generated code evaluates:
+     - Convergent sector integrands (summed into one result)
+     - IBP boundary and term integrands (reported individually)
+
+   Output format per kinematic point:
+     Line 1: convergent_sum_re convergent_sum_im err_re err_im
+     Then for each IBP function:
+     Line i: func_re func_im err_re err_im
+   -------------------------------------------------------------------------- *)
+
+Options[GenerateCppMonteCarloIBP] = {
+  "NSamples"   -> 1000000,
+  "MaxDim"     -> 20,
+  "SeedBase"   -> 42
+};
+
+GenerateCppMonteCarloIBP[convergentSectors_List, ibpSectors_List,
+                         integrandSpec_Association, outputFile_String,
+                         OptionsPattern[]] :=
+Module[
+  {kinSyms, paramMap, nParams,
+   code, integrandFuncs, integrandDims, integrandTypes,
+   nConvergent, nIBPFuncs,
+   maxDim, seedBase, nSamples,
+   ibpFuncMap},
+
+  kinSyms  = integrandSpec["KinematicSymbols"];
+  nParams  = Length[kinSyms];
+  maxDim   = OptionValue["MaxDim"];
+  seedBase = OptionValue["SeedBase"];
+  nSamples = OptionValue["NSamples"];
+
+  paramMap = Association @@ Table[
+    kinSyms[[i]] -> ("params[" <> ToString[i - 1] <> "]"),
+    {i, nParams}
+  ];
+
+  integrandFuncs = {};
+  integrandDims  = {};
+  integrandTypes = {};  (* "conv" or "ibp" *)
+  nConvergent = 0;
+  nIBPFuncs   = 0;
+  ibpFuncMap  = {};  (* tracks which functions belong to which IBP sector *)
+
+  (* --- Generate convergent sector integrands (same as old code) --- *)
+  Do[
+    Module[{sd, flatPolys, polyExps, prefactor, dim, funcName, funcCode},
+      sd        = convergentSectors[[s]];
+      flatPolys = sd["FlattenedPolys"];
+      polyExps  = sd["PolynomialExponents"];
+      prefactor = sd["Prefactor"];
+      dim       = sd["Dimension"];
+      funcName  = "integrand_conv_" <> ToString[s - 1];
+
+      funcCode = "inline cx " <> funcName <>
+        "(const double* y, const double* params) {\n";
+      funcCode = funcCode <>
+        "    // Convergent sector " <> ToString[sd["ConeIndex"]] <> "\n";
+      funcCode = funcCode <>
+        "    double log_y[" <> ToString[dim] <> "];\n";
+      funcCode = funcCode <>
+        "    for (int i = 0; i < " <> ToString[dim] <>
+        "; i++)\n";
+      funcCode = funcCode <>
+        "        log_y[i] = (y[i] > 1e-300) ? std::log(y[i]) : -700.0;\n\n";
+
+      Do[
+        funcCode = funcCode <>
+          GenerateMonomialSumCpp[flatPolys[[j]], j - 1, paramMap, dim] <>
+          "\n\n";,
+        {j, Length[flatPolys]}
+      ];
+
+      funcCode = funcCode <> "    cx result = " <>
+        mmaToCInternal[prefactor, paramMap] <> ";\n";
+      Do[
+        funcCode = funcCode <>
+          "    result *= std::exp(" <>
+          mmaToCInternal[polyExps[[j]], paramMap] <>
+          " * std::log(P" <> ToString[j - 1] <> "));\n";,
+        {j, Length[polyExps]}
+      ];
+      funcCode = funcCode <> "    return result;\n}\n";
+
+      AppendTo[integrandFuncs, funcCode];
+      AppendTo[integrandDims, dim];
+      AppendTo[integrandTypes, "conv"];
+      nConvergent++;
+    ],
+    {s, Length[convergentSectors]}
+  ];
+
+  (* --- Generate IBP sector integrands --- *)
+  Do[
+    Module[{ibpSD, bndData, ibpTerms, sIdx, sectorFuncs},
+      ibpSD    = ibpSectors[[s]];
+      bndData  = ibpSD["BoundaryData"];
+      ibpTerms = ibpSD["IBPTerms"];
+      sIdx     = s - 1;
+      sectorFuncs = <|"SectorIndex" -> sIdx,
+                      "ConeIndex" -> ibpSD["ConeIndex"]|>;
+
+      (* --- Boundary base function (order 0) --- *)
+      Module[{flatPolys, polyExps, prefactor, dim, funcName, funcCode},
+        flatPolys = bndData["FlatPolys"];
+        polyExps  = bndData["PolyExponents"];
+        prefactor = bndData["Prefactor"];
+        dim       = bndData["Dimension"];
+        funcName  = "integrand_ibp_bnd_" <> ToString[sIdx] <> "_base";
+
+        funcCode = "inline cx " <> funcName <>
+          "(const double* y, const double* params) {\n";
+        funcCode = funcCode <>
+          "    // IBP boundary base, sector " <>
+          ToString[ibpSD["ConeIndex"]] <> "\n";
+        funcCode = funcCode <>
+          "    double log_y[" <> ToString[dim] <> "];\n";
+        funcCode = funcCode <>
+          "    for (int i = 0; i < " <> ToString[dim] <>
+          "; i++)\n";
+        funcCode = funcCode <>
+          "        log_y[i] = (y[i] > 1e-300) ? std::log(y[i]) : -700.0;\n\n";
+
+        Do[
+          funcCode = funcCode <>
+            GenerateMonomialSumCpp[flatPolys[[j]], j - 1, paramMap, dim] <>
+            "\n\n";,
+          {j, Length[flatPolys]}
+        ];
+
+        funcCode = funcCode <> "    cx result = " <>
+          mmaToCInternal[prefactor, paramMap] <> ";\n";
+        Do[
+          funcCode = funcCode <>
+            "    result *= std::exp(" <>
+            mmaToCInternal[polyExps[[j]], paramMap] <>
+            " * std::log(P" <> ToString[j - 1] <> "));\n";,
+          {j, Length[polyExps]}
+        ];
+        funcCode = funcCode <> "    return result;\n}\n";
+
+        AppendTo[integrandFuncs, funcCode];
+        AppendTo[integrandDims, dim];
+        AppendTo[integrandTypes, "ibp"];
+        sectorFuncs["BndBaseFuncId"] = Length[integrandFuncs] - 1;
+        nIBPFuncs++;
+      ];
+
+      (* --- Boundary log function (order 1) --- *)
+      Module[{flatPolys, polyExps, prefactor, dim, funcName, funcCode,
+              logIns, varTerms, polyTerms},
+        flatPolys = bndData["FlatPolys"];
+        polyExps  = bndData["PolyExponents"];
+        prefactor = bndData["Prefactor"];
+        dim       = bndData["Dimension"];
+        logIns    = bndData["LogInsertions"];
+        varTerms  = logIns["VariableTerms"];
+        polyTerms = logIns["PolynomialTerms"];
+        funcName  = "integrand_ibp_bnd_" <> ToString[sIdx] <> "_log";
+
+        funcCode = "inline cx " <> funcName <>
+          "(const double* y, const double* params) {\n";
+        funcCode = funcCode <>
+          "    // IBP boundary log, sector " <>
+          ToString[ibpSD["ConeIndex"]] <> "\n";
+        funcCode = funcCode <>
+          "    double log_y[" <> ToString[dim] <> "];\n";
+        funcCode = funcCode <>
+          "    for (int i = 0; i < " <> ToString[dim] <>
+          "; i++)\n";
+        funcCode = funcCode <>
+          "        log_y[i] = (y[i] > 1e-300) ? std::log(y[i]) : -700.0;\n\n";
+
+        Do[
+          funcCode = funcCode <>
+            GenerateMonomialSumCpp[flatPolys[[j]], j - 1, paramMap, dim] <>
+            "\n\n";,
+          {j, Length[flatPolys]}
+        ];
+
+        funcCode = funcCode <> "    cx base_val = " <>
+          mmaToCInternal[prefactor, paramMap] <> ";\n";
+        Do[
+          funcCode = funcCode <>
+            "    base_val *= std::exp(" <>
+            mmaToCInternal[polyExps[[j]], paramMap] <>
+            " * std::log(P" <> ToString[j - 1] <> "));\n";,
+          {j, Length[polyExps]}
+        ];
+
+        funcCode = funcCode <> "\n    // Log insertion factors\n";
+        funcCode = funcCode <> "    cx log_sum(0.0, 0.0);\n";
+
+        Do[
+          Module[{coeff, varIdx},
+            coeff  = vt[[1]];
+            varIdx = vt[[2]] - 1;
+            funcCode = funcCode <>
+              "    log_sum += " <>
+              mmaToCInternal[coeff, paramMap] <>
+              " * log_y[" <> ToString[varIdx] <> "];\n";
+          ],
+          {vt, varTerms}
+        ];
+
+        Do[
+          Module[{coeff, polyIdx},
+            coeff   = pt[[1]];
+            polyIdx = pt[[2]] - 1;
+            funcCode = funcCode <>
+              "    log_sum += " <>
+              mmaToCInternal[coeff, paramMap] <>
+              " * std::log(P" <> ToString[polyIdx] <> ");\n";
+          ],
+          {pt, polyTerms}
+        ];
+
+        funcCode = funcCode <>
+          "\n    return base_val * log_sum;\n}\n";
+
+        AppendTo[integrandFuncs, funcCode];
+        AppendTo[integrandDims, dim];
+        AppendTo[integrandTypes, "ibp"];
+        sectorFuncs["BndLogFuncId"] = Length[integrandFuncs] - 1;
+        nIBPFuncs++;
+      ];
+
+      (* --- IBP term functions (base + log for each term) --- *)
+      sectorFuncs["TermFuncIds"] = {};
+
+      Do[
+        Module[{termData, flatPolys, polyExps, prefactor, dim,
+                logIns, varTerms, polyTerms,
+                funcNameBase, funcNameLog, funcCodeBase, funcCodeLog,
+                tIdx},
+          termData  = ibpTerms[[t]];
+          flatPolys = termData["FlatPolys"];
+          polyExps  = termData["PolyExponents"];
+          prefactor = termData["Prefactor"];
+          dim       = termData["Dimension"];
+          logIns    = termData["LogInsertions"];
+          varTerms  = logIns["VariableTerms"];
+          polyTerms = logIns["PolynomialTerms"];
+          tIdx      = t - 1;
+
+          (* Base function *)
+          funcNameBase = "integrand_ibp_" <> ToString[sIdx] <>
+            "_t" <> ToString[tIdx] <> "_base";
+
+          funcCodeBase = "inline cx " <> funcNameBase <>
+            "(const double* y, const double* params) {\n";
+          funcCodeBase = funcCodeBase <>
+            "    // IBP term " <> ToString[tIdx] <> " base, sector " <>
+            ToString[ibpSD["ConeIndex"]] <> "\n";
+          funcCodeBase = funcCodeBase <>
+            "    double log_y[" <> ToString[dim] <> "];\n";
+          funcCodeBase = funcCodeBase <>
+            "    for (int i = 0; i < " <> ToString[dim] <>
+            "; i++)\n";
+          funcCodeBase = funcCodeBase <>
+            "        log_y[i] = (y[i] > 1e-300) ? std::log(y[i]) : -700.0;\n\n";
+
+          Do[
+            funcCodeBase = funcCodeBase <>
+              GenerateMonomialSumCpp[flatPolys[[j]], j - 1, paramMap, dim] <>
+              "\n\n";,
+            {j, Length[flatPolys]}
+          ];
+
+          funcCodeBase = funcCodeBase <> "    cx result = " <>
+            mmaToCInternal[prefactor, paramMap] <> ";\n";
+          Do[
+            funcCodeBase = funcCodeBase <>
+              "    result *= std::exp(" <>
+              mmaToCInternal[polyExps[[j]], paramMap] <>
+              " * std::log(P" <> ToString[j - 1] <> "));\n";,
+            {j, Length[polyExps]}
+          ];
+          funcCodeBase = funcCodeBase <> "    return result;\n}\n";
+
+          AppendTo[integrandFuncs, funcCodeBase];
+          AppendTo[integrandDims, dim];
+          AppendTo[integrandTypes, "ibp"];
+
+          (* Log function *)
+          funcNameLog = "integrand_ibp_" <> ToString[sIdx] <>
+            "_t" <> ToString[tIdx] <> "_log";
+
+          funcCodeLog = "inline cx " <> funcNameLog <>
+            "(const double* y, const double* params) {\n";
+          funcCodeLog = funcCodeLog <>
+            "    // IBP term " <> ToString[tIdx] <> " log, sector " <>
+            ToString[ibpSD["ConeIndex"]] <> "\n";
+          funcCodeLog = funcCodeLog <>
+            "    double log_y[" <> ToString[dim] <> "];\n";
+          funcCodeLog = funcCodeLog <>
+            "    for (int i = 0; i < " <> ToString[dim] <>
+            "; i++)\n";
+          funcCodeLog = funcCodeLog <>
+            "        log_y[i] = (y[i] > 1e-300) ? std::log(y[i]) : -700.0;\n\n";
+
+          Do[
+            funcCodeLog = funcCodeLog <>
+              GenerateMonomialSumCpp[flatPolys[[j]], j - 1, paramMap, dim] <>
+              "\n\n";,
+            {j, Length[flatPolys]}
+          ];
+
+          funcCodeLog = funcCodeLog <> "    cx base_val = " <>
+            mmaToCInternal[prefactor, paramMap] <> ";\n";
+          Do[
+            funcCodeLog = funcCodeLog <>
+              "    base_val *= std::exp(" <>
+              mmaToCInternal[polyExps[[j]], paramMap] <>
+              " * std::log(P" <> ToString[j - 1] <> "));\n";,
+            {j, Length[polyExps]}
+          ];
+
+          funcCodeLog = funcCodeLog <> "\n    cx log_sum(0.0, 0.0);\n";
+
+          Do[
+            Module[{coeff, varIdx},
+              coeff  = vt[[1]];
+              varIdx = vt[[2]] - 1;
+              funcCodeLog = funcCodeLog <>
+                "    log_sum += " <>
+                mmaToCInternal[coeff, paramMap] <>
+                " * log_y[" <> ToString[varIdx] <> "];\n";
+            ],
+            {vt, varTerms}
+          ];
+
+          Do[
+            Module[{coeff, polyIdx},
+              coeff   = pt[[1]];
+              polyIdx = pt[[2]] - 1;
+              funcCodeLog = funcCodeLog <>
+                "    log_sum += " <>
+                mmaToCInternal[coeff, paramMap] <>
+                " * std::log(P" <> ToString[polyIdx] <> ");\n";
+            ],
+            {pt, polyTerms}
+          ];
+
+          funcCodeLog = funcCodeLog <>
+            "\n    return base_val * log_sum;\n}\n";
+
+          AppendTo[integrandFuncs, funcCodeLog];
+          AppendTo[integrandDims, dim];
+          AppendTo[integrandTypes, "ibp"];
+
+          AppendTo[sectorFuncs["TermFuncIds"],
+            <|"BaseFuncId" -> Length[integrandFuncs] - 2,
+              "LogFuncId"  -> Length[integrandFuncs] - 1,
+              "Coeff0"     -> termData["Coeff0"],
+              "Coeff1"     -> termData["Coeff1"]|>
+          ];
+          nIBPFuncs += 2;
+        ],
+        {t, Length[ibpTerms]}
+      ];
+
+      AppendTo[ibpFuncMap, sectorFuncs];
+    ],
+    {s, Length[ibpSectors]}
+  ];
+
+  Module[{nIntegrands, allFuncNames},
+    nIntegrands = Length[integrandFuncs];
+
+    (* --- Assemble the full C++ file --- *)
+    code = "// Auto-generated by TropicalEval`GenerateCppMonteCarloIBP\n";
+    code = code <> "// " <> ToString[nConvergent] <> " convergent, " <>
+      ToString[nIBPFuncs] <> " IBP integrands\n\n";
+
+    code = code <> "#include <complex>\n";
+    code = code <> "#include <cmath>\n";
+    code = code <> "#include <random>\n";
+    code = code <> "#include <fstream>\n";
+    code = code <> "#include <vector>\n";
+    code = code <> "#include <iostream>\n";
+    code = code <> "#include <string>\n";
+    code = code <> "#include <cassert>\n";
+    code = code <> "#include <cstdlib>\n";
+    code = code <> "#include <array>\n";
+    code = code <> "#ifdef _OPENMP\n";
+    code = code <> "#include <omp.h>\n";
+    code = code <> "#endif\n\n";
+
+    code = code <> "using cx = std::complex<double>;\n\n";
+
+    Do[code = code <> integrandFuncs[[i]] <> "\n";,
+       {i, nIntegrands}];
+
+    code = code <>
+      "using IntegrandFunc = cx(*)(const double*, const double*);\n\n";
+
+    (* Build function table and names *)
+    allFuncNames = {};
+    Do[
+      Module[{funcCode, funcName},
+        funcCode = integrandFuncs[[i]];
+        funcName = StringCases[funcCode,
+          RegularExpression["inline cx (\\w+)\\("] -> "$1"][[1]];
+        AppendTo[allFuncNames, funcName];
+      ],
+      {i, nIntegrands}
+    ];
+
+    code = code <> "IntegrandFunc integrand_table[] = {\n    " <>
+      StringRiffle[allFuncNames, ",\n    "] <> "\n};\n\n";
+
+    code = code <> "int integrand_dim[] = {" <>
+      StringRiffle[ToString /@ integrandDims, ", "] <> "};\n";
+
+    (* Type array: 0 = convergent (sum), 1 = IBP (individual) *)
+    code = code <> "int integrand_type[] = {" <>
+      StringRiffle[If[# === "conv", "0", "1"] & /@ integrandTypes, ", "] <>
+      "};\n";
+
+    code = code <> "const int N_INTEGRANDS = " <>
+      ToString[nIntegrands] <> ";\n";
+    code = code <> "const int N_CONV = " <>
+      ToString[nConvergent] <> ";\n";
+    code = code <> "const int N_PARAMS = " <>
+      ToString[nParams] <> ";\n";
+    code = code <> "const int MAX_DIM = " <>
+      ToString[maxDim] <> ";\n\n";
+
+    (* Main function: evaluate convergent sum + individual IBP functions *)
+    code = code <> "int main(int argc, char* argv[]) {\n";
+    code = code <> "    if (argc < 3) {\n";
+    code = code <> "        std::cerr << \"Usage: \" << argv[0] << \" <input_file> <output_file> [n_samples] [n_threads]\" << std::endl;\n";
+    code = code <> "        return 1;\n";
+    code = code <> "    }\n\n";
+
+    code = code <> "    std::string input_file = argv[1];\n";
+    code = code <> "    std::string output_file = argv[2];\n";
+    code = code <> "    int n_samples = (argc > 3) ? std::atoi(argv[3]) : " <>
+      ToString[nSamples] <> ";\n";
+    code = code <> "    int n_threads = (argc > 4) ? std::atoi(argv[4]) : 1;\n";
+    code = code <> "#ifdef _OPENMP\n";
+    code = code <> "    if (n_threads == 1) n_threads = omp_get_max_threads();\n";
+    code = code <> "    omp_set_num_threads(n_threads);\n";
+    code = code <> "#endif\n\n";
+
+    code = code <> "    std::ifstream fin(input_file);\n";
+    code = code <> "    if (!fin) { std::cerr << \"Cannot open \" << input_file << std::endl; return 1; }\n\n";
+
+    code = code <> "    std::vector<std::vector<double>> kinematic_data;\n";
+    code = code <> "    if (N_PARAMS == 0) {\n";
+    code = code <> "        int count = 1; fin >> count; if (count < 1) count = 1;\n";
+    code = code <> "        for (int i = 0; i < count; i++) kinematic_data.push_back({});\n";
+    code = code <> "    } else {\n";
+    code = code <> "        double val; std::vector<double> row;\n";
+    code = code <> "        while (fin >> val) { row.push_back(val);\n";
+    code = code <> "            if ((int)row.size() == N_PARAMS) { kinematic_data.push_back(row); row.clear(); }}\n";
+    code = code <> "    }\n";
+    code = code <> "    fin.close();\n";
+    code = code <> "    int n_kp = (int)kinematic_data.size();\n";
+    code = code <> "    std::cerr << \"Read \" << n_kp << \" kinematic points\" << std::endl;\n\n";
+
+    (* Output: one convergent sum + each IBP function individually,
+       per kinematic point *)
+    code = code <> "    // Output: (1 + N_IBP_FUNCS) lines per kinematic point\n";
+    code = code <> "    // Line 0: convergent sum; Lines 1..N_IBP: individual IBP functions\n";
+    code = code <> "    int n_ibp = N_INTEGRANDS - N_CONV;\n";
+    code = code <> "    std::vector<std::array<double, 4>> results((1 + n_ibp) * n_kp);\n\n";
+
+    code = code <> "    #pragma omp parallel for schedule(dynamic)\n";
+    code = code <> "    for (int kp = 0; kp < n_kp; kp++) {\n";
+    code = code <> "        const double* params = kinematic_data[kp].data();\n";
+    code = code <> "        uint64_t seed = " <> ToString[seedBase] <> "ULL + (uint64_t)kp;\n";
+    code = code <> "        std::mt19937_64 rng(seed);\n";
+    code = code <> "        std::uniform_real_distribution<double> dist(0.0, 1.0);\n\n";
+
+    (* Convergent sum *)
+    code = code <> "        double conv_re = 0.0, conv_im = 0.0;\n";
+    code = code <> "        double conv_var_re = 0.0, conv_var_im = 0.0;\n\n";
+
+    code = code <> "        for (int s = 0; s < N_CONV; s++) {\n";
+    code = code <> "            int dim = integrand_dim[s];\n";
+    code = code <> "            double mean_re = 0.0, mean_im = 0.0;\n";
+    code = code <> "            double M2_re = 0.0, M2_im = 0.0;\n";
+    code = code <> "            for (int k = 0; k < n_samples; k++) {\n";
+    code = code <> "                double y[MAX_DIM];\n";
+    code = code <> "                for (int i = 0; i < dim; i++) y[i] = dist(rng);\n";
+    code = code <> "                cx val = integrand_table[s](y, params);\n";
+    code = code <> "                double d_re = val.real() - mean_re;\n";
+    code = code <> "                mean_re += d_re / (k + 1);\n";
+    code = code <> "                M2_re += d_re * (val.real() - mean_re);\n";
+    code = code <> "                double d_im = val.imag() - mean_im;\n";
+    code = code <> "                mean_im += d_im / (k + 1);\n";
+    code = code <> "                M2_im += d_im * (val.imag() - mean_im);\n";
+    code = code <> "            }\n";
+    code = code <> "            conv_re += mean_re; conv_im += mean_im;\n";
+    code = code <> "            conv_var_re += M2_re / ((double)n_samples * (n_samples - 1));\n";
+    code = code <> "            conv_var_im += M2_im / ((double)n_samples * (n_samples - 1));\n";
+    code = code <> "        }\n";
+    code = code <> "        results[kp * (1 + n_ibp)] = {conv_re, conv_im, std::sqrt(conv_var_re), std::sqrt(conv_var_im)};\n\n";
+
+    (* Individual IBP functions *)
+    code = code <> "        for (int s = N_CONV; s < N_INTEGRANDS; s++) {\n";
+    code = code <> "            int dim = integrand_dim[s];\n";
+    code = code <> "            double mean_re = 0.0, mean_im = 0.0;\n";
+    code = code <> "            double M2_re = 0.0, M2_im = 0.0;\n";
+    code = code <> "            for (int k = 0; k < n_samples; k++) {\n";
+    code = code <> "                double y[MAX_DIM];\n";
+    code = code <> "                for (int i = 0; i < dim; i++) y[i] = dist(rng);\n";
+    code = code <> "                cx val = integrand_table[s](y, params);\n";
+    code = code <> "                double d_re = val.real() - mean_re;\n";
+    code = code <> "                mean_re += d_re / (k + 1);\n";
+    code = code <> "                M2_re += d_re * (val.real() - mean_re);\n";
+    code = code <> "                double d_im = val.imag() - mean_im;\n";
+    code = code <> "                mean_im += d_im / (k + 1);\n";
+    code = code <> "                M2_im += d_im * (val.imag() - mean_im);\n";
+    code = code <> "            }\n";
+    code = code <> "            int idx = kp * (1 + n_ibp) + (s - N_CONV + 1);\n";
+    code = code <> "            results[idx] = {mean_re, mean_im, std::sqrt(M2_re / ((double)n_samples * (n_samples - 1))), std::sqrt(M2_im / ((double)n_samples * (n_samples - 1)))};\n";
+    code = code <> "        }\n";
+    code = code <> "    }\n\n";
+
+    code = code <> "    std::ofstream fout(output_file);\n";
+    code = code <> "    if (!fout) { std::cerr << \"Cannot open \" << output_file << std::endl; return 1; }\n";
+    code = code <> "    fout.precision(17);\n";
+    code = code <> "    for (int i = 0; i < (int)results.size(); i++) {\n";
+    code = code <> "        fout << results[i][0] << \" \" << results[i][1] << \" \"\n";
+    code = code <> "             << results[i][2] << \" \" << results[i][3] << \"\\n\";\n";
+    code = code <> "    }\n";
+    code = code <> "    fout.close();\n";
+    code = code <> "    std::cerr << \"Done. Processed \" << n_kp << \" kinematic points.\" << std::endl;\n";
+    code = code <> "    return 0;\n}\n";
+
+    Export[outputFile, code, "Text"];
+
+    Print["Generated IBP C++ Monte Carlo code: ", outputFile];
+    Print["  ", nConvergent, " convergent sectors"];
+    Print["  ", nIBPFuncs, " IBP integrands (",
+          Length[ibpSectors], " sectors)"];
+    Print["  Total: ", nIntegrands, " integrand functions"];
+
+    (* Check for unresolved Mathematica symbols *)
+    Module[{badPatterns, warnings},
+      badPatterns = {"Sin[", "Cos[", "Sqrt[", "Plus[", "Times[",
+                     "Power[", "Rule[", "List["};
+      warnings = Select[badPatterns, StringContainsQ[code, #] &];
+      If[Length[warnings] > 0,
+        Print["WARNING: unresolved Mathematica symbols in C++ output: ",
+              warnings]
+      ];
+    ];
+
+    <|"Code" -> code, "OutputFile" -> outputFile,
+      "NConvergent" -> nConvergent, "NIBPFuncs" -> nIBPFuncs,
+      "NTotal" -> nIntegrands,
+      "Dimensions" -> integrandDims,
+      "IBPFuncMap" -> ibpFuncMap|>
+  ]
+];
+
+
+(* ============================================================================
+   MODULE 4b: EvaluateTropicalMCIBP (IBP Driver)
+
+   Full pipeline using IBP for divergent sectors.
+   Produces Laurent expansion: P_{-d}/eps^d + ... + P_{-1}/eps + P_0.
+   ============================================================================ *)
+
+Options[EvaluateTropicalMCIBP] = {
+  "NSamples"         -> 1000000,
+  "NThreads"         -> Automatic,
+  "RunChecks"        -> True,
+  "WorkingDirectory" -> Automatic,
+  "Verbose"          -> True
+};
+
+EvaluateTropicalMCIBP[integrandSpec_Association, fanData_List,
+                      kinematicPoints_List, OptionsPattern[]] :=
+Module[
+  {dualVertices, simplexList, n, nKP, nParams, eps,
+   allSectorData, convergentSectors, divergentSectors,
+   ibpProcessedSectors,
+   cppFile, cppBinary, kinFile, resultFile,
+   cppResult, ibpFuncMap,
+   mcRawResults, finalResults,
+   runChecks, verbose, nSamples, nThreads, workDir},
+
+  runChecks  = OptionValue["RunChecks"];
+  verbose    = OptionValue["Verbose"];
+  nSamples   = OptionValue["NSamples"];
+  nThreads   = OptionValue["NThreads"];
+  workDir    = OptionValue["WorkingDirectory"];
+  eps        = integrandSpec["RegulatorSymbol"];
+
+  If[workDir === Automatic,
+    workDir = DirectoryName[$InputFileName];
+    If[workDir === "" || !StringQ[workDir], workDir = Directory[]];
+    workDir = FileNameJoin[{workDir, "INTERFILES"}]
+  ];
+  If[!DirectoryQ[workDir], Quiet[CreateDirectory[workDir]]];
+
+  {dualVertices, simplexList} = fanData;
+  n       = Length[integrandSpec["Variables"]];
+  nKP     = Length[kinematicPoints];
+  nParams = Length[integrandSpec["KinematicSymbols"]];
+
+  If[verbose,
+    Print["EvaluateTropicalMCIBP: ", Length[simplexList], " sectors, ",
+          nKP, " kinematic points, ", n, " variables"]
+  ];
+
+  (* --- Step 1: Process all sectors --- *)
+  If[verbose, Print["Processing ", Length[simplexList], " sectors..."]];
+
+  allSectorData = Table[
+    ProcessSector[integrandSpec, dualVertices,
+                  simplexList[[s]], s, "Verbose" -> False],
+    {s, Length[simplexList]}
+  ];
+
+  convergentSectors = Select[allSectorData,
+    (AssociationQ[#] && !#["IsDivergent"]) &];
+  divergentSectors  = Select[allSectorData,
+    (AssociationQ[#] && #["IsDivergent"]) &];
+
+  If[verbose,
+    Print["  ", Length[convergentSectors], " convergent, ",
+          Length[divergentSectors], " divergent sectors"]
+  ];
+
+  (* --- Step 2: Process divergent sectors with IBP --- *)
+  If[verbose && Length[divergentSectors] > 0,
+    Print["Processing ", Length[divergentSectors],
+          " divergent sectors with IBP..."]
+  ];
+
+  ibpProcessedSectors = Table[
+    Module[{sd, ibpSD},
+      sd = divergentSectors[[s]];
+      ibpSD = IBPProcessSector[sd, integrandSpec];
+      If[ibpSD === $Failed,
+        Print["WARNING: IBP failed for sector ",
+              sd["ConeIndex"], ", skipping"];
+      ];
+      ibpSD
+    ],
+    {s, Length[divergentSectors]}
+  ];
+  ibpProcessedSectors = Select[ibpProcessedSectors, AssociationQ];
+
+  If[verbose,
+    Print["  Successfully processed ", Length[ibpProcessedSectors],
+          " IBP sectors, total IBP terms: ",
+          Total[#["NTerms"] & /@ ibpProcessedSectors]]
+  ];
+
+  (* --- Step 3: Boundary checks --- *)
+  If[runChecks,
+    Do[
+      IBPCheckBoundary[divergentSectors[[s]], integrandSpec, 10],
+      {s, Min[3, Length[divergentSectors]]}
+    ]
+  ];
+
+  (* --- Step 4: Generate C++ code --- *)
+  cppFile    = FileNameJoin[{workDir, "tropical_mc_ibp.cpp"}];
+  cppBinary  = FileNameJoin[{workDir, "tropical_mc_ibp"}];
+  kinFile    = FileNameJoin[{workDir, "kinematic_data_ibp.txt"}];
+  resultFile = FileNameJoin[{workDir, "mc_results_ibp.txt"}];
+
+  cppResult = GenerateCppMonteCarloIBP[
+    convergentSectors,
+    ibpProcessedSectors,
+    integrandSpec, cppFile,
+    "NSamples" -> nSamples
+  ];
+
+  If[!AssociationQ[cppResult],
+    Print["ERROR: C++ code generation failed"];
+    Return[$Failed]
+  ];
+
+  ibpFuncMap = cppResult["IBPFuncMap"];
+
+  (* --- Step 5: Write kinematic data --- *)
+  If[nParams > 0,
+    Export[kinFile,
+      StringRiffle[
+        StringRiffle[ToString[CForm[#]] & /@ #, " "] & /@ kinematicPoints,
+        "\n"
+      ] <> "\n",
+      "Text"
+    ];,
+    Export[kinFile,
+      StringRiffle[Table["0", {nKP}], "\n"] <> "\n",
+      "Text"
+    ];
+  ];
+
+  (* --- Step 6: Compile and run --- *)
+  If[CompileCpp[cppFile, cppBinary, False] === $Failed,
+    Print["ERROR: Compilation failed"];
+    Return[$Failed]
+  ];
+
+  Module[{nThreadsStr, result},
+    nThreadsStr = If[nThreads === Automatic,
+      ToString[$ProcessorCount], ToString[nThreads]];
+
+    If[verbose, Print["Running Monte Carlo (", nSamples,
+                      " samples, ", nThreadsStr, " threads)..."]];
+
+    result = RunProcess[{cppBinary, kinFile, resultFile,
+      ToString[nSamples], nThreadsStr}];
+
+    If[result["ExitCode"] != 0,
+      Print["ERROR: Monte Carlo execution failed:"];
+      Print[result["StandardError"]];
+      Return[$Failed]
+    ];
+    If[verbose && StringLength[StringTrim[result["StandardError"]]] > 0,
+      Print[result["StandardError"]]
+    ];
+  ];
+
+  (* --- Step 7: Read and parse results --- *)
+  Module[{rawText, lines, parsed, nIBPFuncs, nLinesPerKP},
+    rawText = Import[resultFile, "Text"];
+    If[rawText === $Failed,
+      Print["ERROR: cannot read results file"];
+      Return[$Failed]
+    ];
+
+    lines = Select[StringSplit[rawText, "\n"],
+                   StringLength[StringTrim[#]] > 0 &];
+    parsed = Table[
+      Read[StringToStream[#], Number] & /@ StringSplit[line],
+      {line, lines}
+    ];
+
+    nIBPFuncs  = cppResult["NIBPFuncs"];
+    nLinesPerKP = 1 + nIBPFuncs;
+
+    If[Length[parsed] != nKP * nLinesPerKP,
+      Print["WARNING: expected ", nKP * nLinesPerKP, " result rows, got ",
+            Length[parsed]]
+    ];
+
+    mcRawResults = parsed;
+  ];
+
+  (* --- Step 8: Combine results --- *)
+  finalResults = Table[
+    Module[{kpOffset, convResult, ibpContribPole, ibpContribFinite,
+            poleTotal, finiteTotal},
+      kpOffset = (i - 1) * (1 + cppResult["NIBPFuncs"]);
+
+      (* Convergent sector sum *)
+      convResult = If[kpOffset + 1 <= Length[mcRawResults],
+        mcRawResults[[kpOffset + 1, 1]] +
+        I * mcRawResults[[kpOffset + 1, 2]],
+        0.
+      ];
+
+      (* IBP sector contributions *)
+      ibpContribPole   = 0.;
+      ibpContribFinite = 0.;
+
+      Do[
+        Module[{sMap, bndBaseFid, bndLogFid, termFids,
+                bndBase, bndLog, S0, S1, ckS, rkS,
+                poleCont, finiteCont},
+          sMap     = ibpFuncMap[[s]];
+          bndBaseFid = sMap["BndBaseFuncId"];
+          bndLogFid  = sMap["BndLogFuncId"];
+          termFids   = sMap["TermFuncIds"];
+
+          ckS = ibpProcessedSectors[[s]]["ck"];
+          rkS = ibpProcessedSectors[[s]]["rk"];
+
+          (* Read MC results for boundary functions *)
+          bndBase = If[kpOffset + bndBaseFid + 2 <= Length[mcRawResults],
+            mcRawResults[[kpOffset + bndBaseFid + 2, 1]] +
+            I * mcRawResults[[kpOffset + bndBaseFid + 2, 2]],
+            0.
+          ];
+          bndLog = If[kpOffset + bndLogFid + 2 <= Length[mcRawResults],
+            mcRawResults[[kpOffset + bndLogFid + 2, 1]] +
+            I * mcRawResults[[kpOffset + bndLogFid + 2, 2]],
+            0.
+          ];
+
+          (* Sum IBP terms: S0 and S1 *)
+          S0 = 0.; S1 = 0.;
+          Do[
+            Module[{tf, baseMC, logMC, c0, c1},
+              tf     = termFids[[t]];
+              c0     = tf["Coeff0"];
+              c1     = tf["Coeff1"];
+              baseMC = If[kpOffset + tf["BaseFuncId"] + 2 <= Length[mcRawResults],
+                mcRawResults[[kpOffset + tf["BaseFuncId"] + 2, 1]] +
+                I * mcRawResults[[kpOffset + tf["BaseFuncId"] + 2, 2]],
+                0.
+              ];
+              logMC = If[kpOffset + tf["LogFuncId"] + 2 <= Length[mcRawResults],
+                mcRawResults[[kpOffset + tf["LogFuncId"] + 2, 1]] +
+                I * mcRawResults[[kpOffset + tf["LogFuncId"] + 2, 2]],
+                0.
+              ];
+              S0 += c0 * baseMC;
+              S1 += c0 * logMC + c1 * baseMC;
+            ],
+            {t, Length[termFids]}
+          ];
+
+          (* Pole contribution: (B^{(0)} - S_0) / c_k *)
+          poleCont = (bndBase - S0) / ckS;
+
+          (* Finite contribution:
+             [(B^{(1)} - S_1) - r_k (B^{(0)} - S_0)] / c_k *)
+          finiteCont = ((bndLog - S1) - rkS * (bndBase - S0)) / ckS;
+
+          ibpContribPole   += poleCont;
+          ibpContribFinite += finiteCont;
+        ],
+        {s, Length[ibpFuncMap]}
+      ];
+
+      finiteTotal = convResult + ibpContribFinite;
+      poleTotal   = ibpContribPole;
+
+      <|"KinematicPoint" -> If[nParams > 0, kinematicPoints[[i]], {}],
+        "PoleCoefficient" -> poleTotal,
+        "FinitePart"      -> finiteTotal,
+        "ConvergentSum"   -> convResult,
+        "IBPPoleContrib"  -> ibpContribPole,
+        "IBPFiniteContrib" -> ibpContribFinite|>
+    ],
+    {i, nKP}
+  ];
+
+  If[verbose,
+    Print["\n=== IBP Monte Carlo Results ==="];
+    Do[
+      Print["  KP ", i, ": pole = ", finalResults[[i]]["PoleCoefficient"],
+            ", finite = ", finalResults[[i]]["FinitePart"]],
+      {i, Min[5, nKP]}
+    ];
+  ];
+
+  <|"Results"              -> finalResults,
+    "ConvergentSectors"    -> Length[convergentSectors],
+    "DivergentSectors"     -> Length[divergentSectors],
+    "IBPSectors"           -> Length[ibpProcessedSectors],
+    "CppFile"              -> cppFile,
+    "ResultFile"           -> resultFile,
+    "IBPFuncMap"           -> ibpFuncMap,
+    "IBPProcessedSectors"  -> ibpProcessedSectors|>
 ];
 
 

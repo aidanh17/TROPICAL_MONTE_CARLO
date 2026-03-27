@@ -1,0 +1,1098 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  backgroundcolor=\color{gray!10},
+  keywordstyle=\color{blue},
+  commentstyle=\color{green!50!black},
+  stringstyle=\color{red!70!black},
+  showstringspaces=false,
+  columns=flexible
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\textit{Tropical Monte Carlo}}
+\fancyhead[R]{\textit{Reference Manual}}
+\fancyfoot[C]{\thepage}
+
+\title{\textbf{Tropical Monte Carlo} \\ \Large Comprehensive Reference Manual}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\vfill
+\begin{center}
+\textit{A numerical integration pipeline for generalized Euler integrals \\
+using tropical geometry and Monte Carlo sampling.}
+\end{center}
+\vfill
+
+\newpage
+\tableofcontents
+\newpage
+
+%=============================================================================
+\section{Overview and Purpose}
+%=============================================================================
+
+The \textbf{Tropical Monte Carlo} project is a numerical integration pipeline for evaluating generalized Euler integrals of the form:
+\begin{equation}\label{eq:main}
+I = \int_{[0,\infty)^n} dx_1 \cdots dx_n \;\prod_{i} x_i^{A_i} \;\prod_{j} P_j(\mathbf{x})^{B_j}
+\end{equation}
+where:
+\begin{itemize}
+  \item $P_j(\mathbf{x})$ are polynomials with real positive coefficients that may depend on kinematic parameters (e.g., masses, momenta in physics).
+  \item $A_i$ are the monomial exponents (may be complex, may depend on a dimensional regulator $\varepsilon$).
+  \item $B_j$ are the polynomial exponents (typically negative, may be complex, may depend on $\varepsilon$).
+\end{itemize}
+
+These integrals arise in quantum field theory (Feynman integrals), cosmological correlator calculations, and precision physics. They are often high-dimensional, and standard numerical quadrature fails for large $n$.
+
+\paragraph{Key Innovation.} The code uses \textbf{tropical geometry}---specifically the Newton polytope fan decomposition---to partition the integration domain into simplicial sectors. Within each sector, symbolic coordinate transformations and a ``flattening'' procedure render the integrand $\mathcal{O}(1)$ on the unit hypercube $[0,1]^n$, making uniform Monte Carlo sampling highly efficient.
+
+A single C++ compilation handles thousands of kinematic points in parallel via OpenMP, since the fan decomposition depends only on the exponent structure, not on the polynomial coefficients.
+
+%=============================================================================
+\section{Mathematical Background}
+%=============================================================================
+
+\subsection{The Problem}
+
+We want to compute:
+\begin{equation}
+I(\lambda) = \int_{[0,\infty)^n} \prod_i x_i^{A_i} \;\prod_j P_j(\mathbf{x};\lambda)^{B_j} \; d\mathbf{x}
+\end{equation}
+for many values of kinematic parameters $\lambda = (\lambda_1, \lambda_2, \ldots)$.
+
+Direct Monte Carlo on $[0,\infty)^n$ is impractical because:
+\begin{itemize}
+  \item The integrand has singular behavior near coordinate hyperplanes ($x_i \to 0$).
+  \item Different monomials dominate in different regions.
+  \item Variance is enormous without importance sampling.
+\end{itemize}
+
+\subsection{Tropical Geometry Approach}
+
+The tropical version of a polynomial $P(\mathbf{x}) = \sum_m c_m \, \mathbf{x}^m$ replaces multiplication with addition and addition with $\min$:
+\begin{equation}
+\mathrm{trop}(P)(\mathbf{w}) = \min_m \{ m \cdot \mathbf{w} \} \qquad (\mathbf{w} \in \mathbb{R}^n)
+\end{equation}
+
+The set of $\mathbf{w}$ where the minimum is achieved by multiple monomials defines the \textit{tropical variety}. The \textbf{Newton polytope} of $P$ is the convex hull of the exponent vectors $\{m\}$. Its \textbf{normal fan} partitions $\mathbb{R}^n$ into cones, each corresponding to a region where one monomial dominates.
+
+\subsection{Why This Helps}
+
+In each cone (sector), the dominant monomial can be factored out symbolically. After a monomial change of variables aligned with the cone's rays, the remaining polynomial has no singular behavior---it equals $1 + (\text{bounded terms})$. A further ``flattening'' coordinate change absorbs the monomial singularity $x^{A-1}$ into the measure, producing an $\mathcal{O}(1)$ integrand on $[0,1]^n$.
+
+%=============================================================================
+\section{File Structure}
+%=============================================================================
+
+\begin{lstlisting}
+TROPICAL_MONTE_CARLO/
+|
+|-- SUMMARY.txt                   Project documentation
+|-- tropical_fan.wl               Tropical fan computation (469 lines)
+|-- tropical_eval.wl              Main evaluation package (3834 lines)
+|
+|-- EXAMPLES/
+|   |-- tropical_eval_examples.wl 14 worked examples + 22-test suite
+|   |-- tropical_fan_examples.wl  Fan computation examples
+|   |-- test_quick.wl             Minimal smoke test (Example 1)
+|   |-- test_cpp.wl               C++ codegen & execution test
+|   |-- test_divergent.wl         Divergent integral tests
+|   |-- prompt_tropical_mc.txt    Original development specification
+|
+|-- CC/                           Cross-checks vs FIESTA
+|   |-- SUMMARY.txt               Comparison results (182 lines)
+|   |-- bubblepp_test/            5D cosmological integral case study
+|   |   |-- main_mc.cpp           Generated C++ (36 conv + 14 div sectors)
+|   |   |-- g0_mc.cpp             G0 integral C++ source
+|   |   |-- kin.txt               Kinematic data
+|   |   |-- results_main.txt      MC results
+|   |   |-- results_g0.txt        G0 results
+|   |-- compare_*.wl              7 comparison scripts
+|   |-- convergence_study*.wl     MC convergence analysis scripts
+|   |-- diagnose_eps_eps.wl       eps/eps cross-term investigation
+|
+|-- INTERFILES/                   Generated intermediate files
+|   |-- .gitignore
+|   |-- test_mc_generated.cpp     Example generated C++ source
+|   |-- test_mc                   Compiled binary
+|   |-- test_kin_data.txt         Input kinematic file
+|   |-- test_mc_results.txt       MC output results
+|
+|-- MANUAL/                       This manual
+\end{lstlisting}
+
+%=============================================================================
+\section{Architecture: The 4-Stage Pipeline}
+%=============================================================================
+
+The code operates as a 4-stage pipeline:
+
+\subsection{Stage 1: Tropical Fan Decomposition}
+\begin{description}[style=nextline]
+  \item[Source:] \texttt{tropical\_fan.wl}
+  \item[Input:] Newton polytope of $P_1 \cdot P_2 \cdots P_m$
+  \item[Process:] Convex hull $\to$ normal fan $\to$ simplicial triangulation
+  \item[Output:] Dual rays + simplicial cones (list of ray-index tuples)
+  \item[External Tool:] Polymake (called via Perl API)
+\end{description}
+
+\subsection{Stage 2: Symbolic Sector Processing}
+\begin{description}[style=nextline]
+  \item[Source:] \texttt{tropical\_eval.wl}, Module~1
+  \item[Input:] Fan decomposition + \texttt{IntegrandSpec}
+  \item[Process:] For each simplicial cone:
+    \begin{enumerate}[label=(\alph*)]
+      \item Build ray matrix $M$, check $\det(M) \neq 0$
+      \item Monomial change of variables $\mathbf{x} \to \mathbf{y}$ via $M$
+      \item Tropical factoring (extract dominant monomials)
+      \item Compute effective exponents $a_{\mathrm{eff}}$
+      \item Flattening substitution $\mathbf{y} \to \mathbf{y}'$ (absorb singularity)
+      \item Divide exponents, compute prefactor
+    \end{enumerate}
+  \item[Output:] \texttt{SectorData} association per cone (13+ fields)
+\end{description}
+
+\subsection{Stage 3: Divergence Regulation}
+\begin{description}[style=nextline]
+  \item[Source:] \texttt{tropical\_eval.wl}, Modules~2 and~2b
+  \item[Input:] Sectors where $\mathrm{Re}(a_k(\varepsilon{=}0)) \leq 0$
+  \item[Process:] Two methods are available:
+\end{description}
+
+\paragraph{Method A: Tropical Subtraction (Module~2, \texttt{ProcessDivergentSector}).}
+Handles sectors with \emph{one} divergent variable.
+    \begin{enumerate}[label=(\alph*)]
+      \item Identify divergent variable $k$, compute $c_k$
+      \item Construct $G_0$ integral ($(n{-}1)$-dimensional, pole coefficient)
+      \item Construct $G_1$ integral ($G_0 \times$ log-insertion terms)
+      \item Construct Remainder (full minus simplified, convergent)
+      \item Compute analytic pole $= 1/c_k$ symbolically
+    \end{enumerate}
+    Output: \texttt{DivergentSectorData} association.
+
+\paragraph{Method B: IBP Pole Extraction (Module~2b, \texttt{IBPProcessSector}).}
+Handles sectors with one \emph{or more} divergent variables (nested divergences) via integration by parts.
+    \begin{enumerate}[label=(\alph*)]
+      \item Identify all divergent variables $y_{k_1}, y_{k_2}, \ldots$
+      \item For each divergent variable, apply IBP to decompose the integral into a sum of monomial terms (each with shifted, convergent exponents) plus a boundary integral at $y_k = 1$
+      \item Series-expand all terms in~$\varepsilon$ before flattening
+      \item Flatten each term independently (different terms get different flattening transforms)
+      \item Compute analytic pole structure: $P_{-d}/\varepsilon^d + \cdots + P_{-1}/\varepsilon + P_0$
+    \end{enumerate}
+    Output: \texttt{IBPSectorData} association.
+
+\subsection{Stage 4: C++ Code Generation and Execution}
+\begin{description}[style=nextline]
+  \item[Source:] \texttt{tropical\_eval.wl}, Modules~3--4
+  \item[Input:] All sector data + kinematic points
+  \item[Process:]
+    \begin{enumerate}[label=(\alph*)]
+      \item Translate Mathematica expressions to C++ strings
+      \item Generate integrand functions (conv, $g_0$, $g_1$, remainder)
+      \item Generate \texttt{main()} with file I/O, OpenMP, Welford statistics
+      \item Compile with \texttt{g++ -std=c++17} (auto-detect OpenMP)
+      \item Execute binary, read results from output file
+      \item Combine MC results with analytic pole contributions
+    \end{enumerate}
+  \item[Output:] Results (mean $\pm$ error per kinematic point)
+\end{description}
+
+%=============================================================================
+\section{Core File Reference}
+%=============================================================================
+
+\subsection{\texttt{tropical\_fan.wl} --- Tropical Fan Decomposition (469 lines)}
+
+\paragraph{Purpose.} Compute the tropical (Newton polytope) fan decomposition using the external tool Polymake.
+
+\paragraph{Key Functions:}
+
+\begin{description}
+  \item[\texttt{PolytopeVertices[integrand, vars]}] ~\\
+    Extracts the Newton polytope from the integrand expression. Collects all monomial exponent vectors from the product of polynomials. Returns a list of integer vectors (lattice points).
+
+  \item[\texttt{convexHullVertices[points]}] ~\\
+    Calls Polymake to compute the convex hull of a set of points. Generates a Perl script that invokes Polymake's polytope library. Returns the vertices of the convex hull.
+
+  \item[\texttt{translateToOriginInteger[vertices]}] ~\\
+    Shifts the polytope so that the origin is an interior point. Uses an interior lattice point for the translation. Important for numerical stability of the fan computation.
+
+  \item[\texttt{ComputeDecomposition[vertices]}] ~\\
+    Master function: triangulates the polytope into simplicial cones. Calls Polymake for the dual fan and simplicial subdivision. Returns \texttt{\{dualVertices, simplexList\}} where each simplex is a tuple of ray indices defining one simplicial cone.
+
+  \item[\texttt{ComputeDecompositiony[vertices]}] ~\\
+    Variant that intersects the fan with the positive orthant. Used when the integration domain requires special handling.
+\end{description}
+
+\paragraph{Polymake Interface.}
+The code auto-detects Polymake at \texttt{/opt/homebrew}, \texttt{/usr/local}, or \texttt{/usr}. It generates temporary Perl scripts passed to Polymake and parses the text output back into Mathematica lists.
+
+\paragraph{Typical Output.}
+For a 2D polynomial with 4 terms:
+\begin{lstlisting}
+dualVertices = {{1,0}, {0,1}, {-1,0}, {0,-1}, {1,1}, ...}
+simplexList  = {{1,2}, {2,3}, {3,4}, {4,5}, ...}
+\end{lstlisting}
+
+%-----------------------------------------------------------------------------
+\subsection{\texttt{tropical\_eval.wl} --- Main Evaluation Package (2216 lines)}
+%-----------------------------------------------------------------------------
+
+\subsubsection{Module 1: \texttt{ProcessSector} (Symbolic Sector Processing)}
+
+\paragraph{Purpose.} Perform the symbolic coordinate transformation for one simplicial cone, converting the integrand into a form suitable for Monte Carlo sampling on $[0,1]^n$.
+
+\paragraph{Function Signature:}
+\begin{lstlisting}
+ProcessSector[integrandSpec, dualVertices, simplex, coneIndex]
+\end{lstlisting}
+
+\paragraph{Algorithm:}
+\begin{enumerate}
+  \item \textbf{Extract rays and build matrix.} Take the $n$ rays for this cone and build $M = -\mathrm{Transpose}[\{\rho_1, \ldots, \rho_n\}]$. The change of variables is $x_i = \prod_j y_j^{M_{ij}}$.
+
+  \item \textbf{Check non-degeneracy.} Verify $\det(M) \neq 0$. Degenerate cones are skipped.
+
+  \item \textbf{Transform polynomials.} Substitute $\mathbf{x} \to \mathbf{y}^M$ in all polynomials: each monomial $c \cdot \mathbf{x}^\alpha$ becomes $c \cdot \mathbf{y}^{\alpha \cdot M}$.
+
+  \item \textbf{Tropical factoring.} For each polynomial $P_k(\mathbf{y})$, find
+    \begin{equation}
+    d_{k,j} = \min_m \bigl(\text{exponent of } y_j \text{ in monomial } m \text{ of } P_k\bigr)
+    \end{equation}
+    Factor out $\mathbf{y}^{d_k}$ to get $Q_k(\mathbf{y})$ with all non-negative exponents. $Q_k$ always contains a constant term (the dominant monomial).
+
+  \item \textbf{Compute effective exponents:}
+    \begin{equation}
+    a_{\mathrm{eff},i} = \mathrm{rawA}_i + \sum_k B_k \cdot d_{k,i}
+    \end{equation}
+
+  \item \textbf{Check convergence.} If $\mathrm{Re}(a_{\mathrm{eff},i}) > 0$ for all $i$, the sector is convergent. Otherwise, flag as divergent.
+
+  \item \textbf{Flatten.} Substitute $y_i \to (y'_i)^{1/a_{\mathrm{eff},i}}$. New exponents become $e_{m,i}/a_{\mathrm{eff},i}$.
+
+  \item \textbf{Compute prefactor:}
+    \begin{equation}
+    \mathrm{prefactor} = \frac{|\det(M)|}{\prod_i a_{\mathrm{eff},i}}
+    \end{equation}
+\end{enumerate}
+
+\paragraph{Output.} A \texttt{SectorData} association with 13+ fields (see Section~\ref{sec:sectordata}).
+
+%---
+\subsubsection{Module 2: \texttt{ProcessDivergentSector} (Divergence Regulation)}
+
+\paragraph{Purpose.} Handle sectors where one integration variable diverges as $1/\varepsilon$, extracting the pole analytically and leaving convergent numerical integrals.
+
+\paragraph{Prerequisite:} \texttt{IdentifyDivergences[sectorData, $\varepsilon$]}
+\begin{itemize}
+  \item Expands $a_k(\varepsilon) = c_k \varepsilon + \mathcal{O}(\varepsilon^2)$.
+  \item Identifies the divergent variable $k$ (with $c_k > 0$, $a_k(0) \leq 0$).
+  \item Currently handles at most one divergent variable per sector.
+\end{itemize}
+
+\paragraph{Decomposition (Tropical Subtraction).}
+The integral for a divergent sector has the structure:
+\begin{equation}
+I_{\mathrm{sector}} = \int y_k^{c_k \varepsilon - 1} \cdot f(\mathbf{y}) \; d\mathbf{y}
+\end{equation}
+which has a $1/(c_k \varepsilon)$ pole from the $y_k \to 0$ region. The decomposition is:
+\begin{equation}
+I_{\mathrm{sector}} = \frac{G_0}{c_k \varepsilon} + \frac{G_1}{c_k} + R
+\end{equation}
+where:
+\begin{description}
+  \item[$G_0$:] $(n{-}1)$-dimensional integral obtained by setting $y_k = 0$. This is the pole coefficient.
+  \item[$G_1$:] $G_0$ integrand multiplied by a log-insertion sum:
+    \begin{equation}
+    \sum_i \frac{a_i^{(1)}}{a_i^{(0)}} \log(y'_i) + \sum_j B_j^{(1)} \log(Q_j|_{y_k=0})
+    \end{equation}
+    where $a^{(0)}, a^{(1)}$ are the $\varepsilon^0$ and $\varepsilon^1$ coefficients.
+  \item[$R$ (Remainder):] Integral of $[\text{full} - \text{simplified}] \times y_k^{a_{0,k}-1}$, which is convergent because the divergent piece has been subtracted.
+\end{description}
+
+The analytic pole $1/c_k$ is computed symbolically in Mathematica. $G_0$, $G_1$, and $R$ are evaluated numerically via C++ Monte Carlo.
+
+%---
+\subsubsection{Module 2b: \texttt{IBPProcessSector} (IBP-Based Pole Extraction)}
+
+\paragraph{Purpose.} Handle divergent sectors---including those with \emph{multiple} divergent variables (nested divergences)---using integration by parts.  This module is fully additive: it does not modify any existing functions.  The tropical subtraction scheme (Module~2) is retained alongside it.
+
+\paragraph{Mathematical Idea.}
+For a divergent variable $y_k$ with effective exponent $a_k = c_k\varepsilon + \mathcal{O}(\varepsilon^2)$, the IBP identity on $[0,1]$ gives:
+\begin{equation}
+\int_0^1 y_k^{a_k-1} f(\mathbf{y})\,dy_k
+= \frac{1}{a_k}\Bigl[f(\mathbf{y})\big|_{y_k=1} - \int_0^1 y_k^{a_k}\,\partial_{y_k} f(\mathbf{y})\,dy_k\Bigr]
+\end{equation}
+The derivative $\partial_{y_k}$ acts on the polynomial product $\prod_j Q_j^{B_j}$:
+\begin{equation}
+\partial_{y_k}\prod_j Q_j^{B_j} = \sum_j B_j\,Q_j^{B_j-1}\,(\partial_{y_k}Q_j)\prod_{l\neq j}Q_l^{B_l}
+\end{equation}
+Each monomial of $\partial_{y_k}Q_j$ produces a separate integral term with shifted exponents.  Crucially, the new effective exponent for $y_k$ is $a_k + e_{m,k} \geq 1$ at $\varepsilon=0$ (since $e_{m,k}\geq 1$ for monomials contributing to the derivative), so the divergence in $y_k$ is resolved.
+
+\paragraph{Boundary Term.}
+On the domain $[0,1]^n$, the IBP produces a non-vanishing boundary contribution at $y_k=1$:
+\begin{equation}
+B_{\mathrm{boundary}} = \int_{[0,1]^{n-1}} f(\mathbf{y})\big|_{y_k=1}\,d\mathbf{y}_{\neq k}
+\end{equation}
+This is an $(n{-}1)$-dimensional convergent integral with the same structure as $G_0$ (but evaluating $Q_j$ at $y_k=1$ instead of $y_k=0$).  The boundary at $y_k=0$ vanishes for $\mathrm{Re}(a_k)>0$.
+
+\paragraph{Full Formula (Single Divergence).}
+\begin{equation}
+I_{\mathrm{sector}} = \frac{1}{a_k}\Bigl[B_{\mathrm{boundary}} - \sum_t \mathrm{coeff}_t\,I_t\Bigr]
+\end{equation}
+where each $I_t$ is a convergent $n$-dimensional integral from the monomial decomposition of the derivative, and $\mathrm{coeff}_t = B_j\cdot c_m\cdot e_{m,k}$.
+
+\paragraph{$\varepsilon$-Expansion and Pole Structure.}
+The prefactor $1/a_k = 1/(c_k\varepsilon)(1 - r_k\varepsilon + \cdots)$ produces the $1/\varepsilon$ pole:
+\begin{align}
+\text{Pole:}\quad & \frac{B^{(0)} - S_0}{c_k\varepsilon} \\
+\text{Finite:}\quad & \frac{(B^{(1)} - S_1) - r_k(B^{(0)} - S_0)}{c_k}
+\end{align}
+where $S_0 = \sum_t \mathrm{coeff}_t^{(0)}I_{t,0}$, $S_1 = \sum_t(\mathrm{coeff}_t^{(0)}I_{t,1} + \mathrm{coeff}_t^{(1)}I_{t,0})$, and $r_k = a_k^{(2)}/c_k$.
+
+\paragraph{Nested Divergences.}
+When multiple variables $y_{k_1}, y_{k_2}, \ldots$ are divergent, the IBP is applied iteratively.  Each step resolves one variable and may split terms further.  The prefactor becomes $\prod_m(-1/a_{k_m})$, producing poles up to $1/\varepsilon^d$ for $d$ divergent variables.
+
+\paragraph{Key Functions:}
+\begin{description}
+  \item[\texttt{IBPReduceSector[sectorData, eps]}] Symbolic IBP decomposition: identifies all divergent variables and iteratively applies IBP to produce a list of convergent terms.
+  \item[\texttt{IBPProcessSector[sectorData, integrandSpec]}] Full pipeline: IBP reduction + $\varepsilon$-expansion + per-term flattening + boundary construction.  Returns an \texttt{IBPSectorData} association ready for C++ codegen.
+  \item[\texttt{IBPCheckBoundary[sectorData, integrandSpec, nPoints]}] Numerically verifies that IBP boundary terms are well-behaved.
+  \item[\texttt{ValidateIBP[ibpSD, sectorData, integrandSpec, kin, eps]}] Cross-checks the IBP formula $(1/a_k)[B - \sum_t\mathrm{coeff}_t I_t]$ against direct \texttt{NIntegrate} at finite~$\varepsilon$.
+  \item[\texttt{GenerateCppMonteCarloIBP[conv, ibp, spec, file]}] Generates C++ code with per-function output for IBP integrands.
+  \item[\texttt{EvaluateTropicalMCIBP[spec, fanData, kin, opts]}] Top-level driver using IBP for all divergent sectors.  Returns pole coefficients and finite parts.
+\end{description}
+
+%---
+\subsubsection{Module 3: \texttt{MmaToC} and \texttt{GenerateCppMonteCarlo} (C++ Code Generation)}
+
+\paragraph{\texttt{MmaToC[expr, kinematicSymbols]}.} Recursive pattern-matching converter from Mathematica to C++:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Mathematica} & \textbf{C++} \\
+\midrule
+Integer $n$ & \texttt{n.0} \\
+Rational $p/q$ & \texttt{(p.0/q.0)} \\
+\texttt{Complex[a,b]} & \texttt{cx(a, b)} \\
+\texttt{Power[x, n]} & \texttt{std::pow(x, n)} \\
+\texttt{Log[x]} & \texttt{std::log(x)} \\
+\texttt{Plus[a, b, ...]} & \texttt{(a + b + ...)} \\
+\texttt{Times[a, b, ...]} & \texttt{(a * b * ...)} \\
+Kinematic symbol & \texttt{params[i]} \\
+Variable \texttt{y[j]} & \texttt{y[j-1]} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Polynomial evaluation uses the \textbf{log-exp trick}:
+\begin{equation}
+c \cdot y_1^{\alpha_1} \cdot y_2^{\alpha_2} = c \cdot \exp\bigl(\alpha_1 \log(y_1) + \alpha_2 \log(y_2)\bigr)
+\end{equation}
+
+\paragraph{\texttt{GenerateCppMonteCarlo[...]}.} Generates a complete C++ source file with:
+
+\begin{itemize}
+  \item \textbf{4 types of integrand functions} per relevant sector:
+    \begin{description}
+      \item[\texttt{integrand\_conv\_N}:] Convergent sector---returns $\mathrm{prefactor} \times \prod_j Q_j(\mathbf{y})^{B_j}$.
+      \item[\texttt{integrand\_g0\_N}:] Divergent sector $G_0$---$(n{-}1)$-dim with simplified polynomials.
+      \item[\texttt{integrand\_g1\_N}:] Divergent sector $G_1$---$G_0 \times$ log-insertion sum.
+      \item[\texttt{integrand\_rem\_N}:] Divergent sector Remainder---$\mathrm{prefactor} \times y_k^{a_{0,k}-1} \times (\text{full} - \text{simplified})$.
+    \end{description}
+  \item \textbf{Function table}: Array of \texttt{\{function\_pointer, dimension, type\_flag\}} for dispatch.
+  \item \textbf{\texttt{main()} function}: File I/O for kinematic data, OpenMP parallelization over kinematic points, Welford online algorithm for mean and variance, optional debug mode with NaN detection.
+  \item \textbf{Output format}: One line per kinematic point with columns: \texttt{real\_part~~imag\_part~~error\_real~~error\_imag}.
+\end{itemize}
+
+\paragraph{Compilation:}
+\begin{lstlisting}[language=bash]
+g++ -O2 -std=c++17 -fopenmp output.cpp -o output
+\end{lstlisting}
+Auto-retries without \texttt{-fopenmp} if linking fails (e.g., on macOS with clang).
+
+%---
+\subsubsection{Module 4: \texttt{EvaluateTropicalMC} (Top-Level Driver)}
+
+\paragraph{Purpose.} Orchestrate the entire pipeline from \texttt{IntegrandSpec} to final numerical results.
+
+\paragraph{Function Signature:}
+\begin{lstlisting}
+EvaluateTropicalMC[integrandSpec, fanData, kinematicPoints, opts...]
+\end{lstlisting}
+
+\paragraph{Algorithm:}
+\begin{enumerate}
+  \item Validate \texttt{IntegrandSpec} (check all required fields).
+  \item \texttt{ProcessSector} for all simplicial cones in the fan.
+  \item (Optional) \texttt{ValidateDecomposition}: cross-check one kinematic point against Mathematica's \texttt{NIntegrate}.
+  \item Separate sectors into convergent and divergent lists.
+  \item \texttt{ProcessDivergentSector} for each divergent sector.
+  \item Substitute $\varepsilon \to \texttt{epsValue}$ in all symbolic expressions.
+  \item Write kinematic data to temporary file.
+  \item \texttt{GenerateCppMonteCarlo} (write C++ source).
+  \item Compile C++ (debug build first if requested, then release).
+  \item Execute binary, read results from output file.
+  \item Combine MC results with analytic pole contributions:
+    \begin{equation}
+    \mathrm{total} = \sum_{\mathrm{conv}} I_{\mathrm{conv}} + \sum_{\mathrm{div}} \left[\frac{G_0}{c_k \varepsilon} + \frac{G_1}{c_k} + R\right]
+    \end{equation}
+  \item Print error summary, optionally validate against \texttt{NIntegrate}.
+\end{enumerate}
+
+\paragraph{Options:}
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Option} & \textbf{Default} & \textbf{Description} \\
+\midrule
+\texttt{EpsilonValue} & 0.01 & Value of regulator $\varepsilon$ \\
+\texttt{NSamples} & 1\,000\,000 & MC samples per sector \\
+\texttt{DebugMode} & \texttt{False} & Enable debug C++ build \\
+\texttt{ValidateFirst} & \texttt{False} & Run \texttt{NIntegrate} cross-check \\
+\texttt{OutputFile} & (auto) & Path for C++ source \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%=============================================================================
+\section{Data Structures}
+%=============================================================================
+
+\subsection{\texttt{IntegrandSpec} (Mathematica Association)}
+
+\begin{center}
+\begin{tabular}{lp{9cm}}
+\toprule
+\textbf{Key} & \textbf{Description} \\
+\midrule
+\texttt{"Polynomials"} & $\{P_1, P_2, \ldots\}$ --- symbolic polynomial expressions. Coefficients may depend on kinematic symbols. \\
+\texttt{"MonomialExponents"} & $\{A_1, \ldots, A_n\}$ --- one per integration variable. May be numeric, symbolic in $\varepsilon$, or complex. \\
+\texttt{"PolynomialExponents"} & $\{B_1, \ldots, B_m\}$ --- one per polynomial. Typically negative. May depend on $\varepsilon$. \\
+\texttt{"Variables"} & $\{x_1, \ldots, x_n\}$ --- integration variable symbols. \\
+\texttt{"KinematicSymbols"} & $\{\lambda, \mu, \ldots\}$ or $\{\}$ --- parameters varying across evaluation points. \\
+\texttt{"RegulatorSymbol"} & $\varepsilon$ or \texttt{None} --- dimensional regulator. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\texttt{SectorData} (from \texttt{ProcessSector})}\label{sec:sectordata}
+
+\begin{center}
+\begin{tabular}{lp{9cm}}
+\toprule
+\textbf{Key} & \textbf{Description} \\
+\midrule
+\texttt{"ConeIndex"} & Integer label for this simplicial cone. \\
+\texttt{"RayMatrix"} & $M$ ($n \times n$). Defines the change of variables $\mathbf{x} = \mathbf{y}^M$. \\
+\texttt{"DetM"} & $\det(M)$. $|\det(M)|$ appears in the Jacobian. \\
+\texttt{"SelectedRays"} & $\{\rho_1, \ldots, \rho_n\}$ --- ray vectors defining this cone. \\
+\texttt{"RawExponents"} & Exponents after the $M$-transformation, before tropical factoring. \\
+\texttt{"NewExponents"} & Effective exponents: $a_{\mathrm{eff},i} = \mathrm{rawA}_i + \sum_k B_k d_{k,i}$. \\
+\texttt{"MinExponents"} & $\{d_{k,j}\}$ per polynomial. Minimum exponent of $y_j$ across monomials of $P_k$. \\
+\texttt{"TransformedPolys"} & Monomials in $\mathbf{y}$ (exponents may be negative). \\
+\texttt{"ClearedPolys"} & After tropical factoring. All exponents $\geq 0$. \\
+\texttt{"FlattenedPolys"} & After flattening. Exponents are $e_{m,i}/a_{\mathrm{eff},i}$. \\
+\texttt{"Prefactor"} & $|\det(M)|/\prod_i a_{\mathrm{eff},i}$. May depend on $\varepsilon$. \\
+\texttt{"IsDivergent"} & \texttt{True} or \texttt{False}. \\
+\texttt{"DivergentVariable"} & Index $k$ (1-based) or 0 if convergent. \\
+\texttt{"Dimension"} & $n$, number of integration variables. \\
+\texttt{"PolynomialExponents"} & $\{B_1, \ldots\}$, copied from \texttt{IntegrandSpec}. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\texttt{DivergentSectorData} (from \texttt{ProcessDivergentSector})}
+
+Extends \texttt{SectorData} with:
+
+\begin{center}
+\begin{tabular}{lp{9cm}}
+\toprule
+\textbf{Key} & \textbf{Description} \\
+\midrule
+\texttt{"G0FlatPolys"} & $(n{-}1)$-dim flattened polynomials with $y_k$ set to 0. \\
+\texttt{"G0Prefactor"} & Prefactor for the $G_0$ integral. \\
+\texttt{"G0Dimension"} & $n - 1$. \\
+\texttt{"G1LogInsertions"} & Association with \texttt{"VariableTerms"} ($a_i^{(1)}/a_i^{(0)}$) and \texttt{"PolynomialTerms"} ($B_j^{(1)}$). \\
+\texttt{"Remainder"} & Association: \texttt{"FullPolys"}, \texttt{"SimplifiedPolys"}, \texttt{"Prefactor"}, \texttt{"DivVarExponent"}. \\
+\texttt{"AnalyticPole"} & $1/c_k$ (symbolic). \\
+\texttt{"ck"} & Leading coefficient of $a_k(\varepsilon)$. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\texttt{IBPSectorData} (from \texttt{IBPProcessSector})}
+
+\begin{center}
+\begin{tabular}{lp{9cm}}
+\toprule
+\textbf{Key} & \textbf{Description} \\
+\midrule
+\texttt{"ConeIndex"} & Integer label for this sector. \\
+\texttt{"Method"} & \texttt{"IBP"} (distinguishes from subtraction). \\
+\texttt{"DivergentVariables"} & List of divergent variable indices. \\
+\texttt{"NDivergent"} & Number of divergent variables. \\
+\texttt{"ck"} & Leading coefficient $c_k$ of $a_k(\varepsilon)$. \\
+\texttt{"rk"} & Second-order correction $a_k^{(2)}/c_k$. \\
+\texttt{"BoundaryData"} & Association for the $y_k=1$ boundary integral: \texttt{"FlatPolys"}, \texttt{"Prefactor"}, \texttt{"Dimension"} ($n{-}1$), \texttt{"PolyExponents"}, \texttt{"LogInsertions"}. \\
+\texttt{"IBPTerms"} & List of term associations, each with: \texttt{"FlatPolys"}, \texttt{"Prefactor"}, \texttt{"Dimension"} ($n$), \texttt{"PolyExponents"}, \texttt{"Coeff0"}, \texttt{"Coeff1"}, \texttt{"LogInsertions"}, \texttt{"Alpha0"}, \texttt{"Alpha1"}. \\
+\texttt{"NTerms"} & Number of IBP terms. \\
+\texttt{"IBPPrefactors"} & List of $-1/a_{k_m}$ factors (one per IBP step). \\
+\texttt{"AnalyticPole"} & $1/c_k$ (symbolic). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%=============================================================================
+\section{Key Algorithms}
+%=============================================================================
+
+\subsection{Tropical (Newton Polytope) Decomposition}
+
+Given polynomials $P_1, \ldots, P_m$, form the product $P = P_1 \cdots P_m$.
+
+The Newton polytope $\mathrm{NP}(P)$ is the convex hull of the exponent vectors $\{\alpha : \mathbf{x}^\alpha \text{ appears in } P\}$.
+
+The \textbf{normal fan} of $\mathrm{NP}(P)$ partitions $\mathbb{R}^n$ into polyhedral cones. Each full-dimensional cone $C_\sigma$ corresponds to a vertex $\sigma$ of $\mathrm{NP}(P)$. Points $\mathbf{w} \in C_\sigma$ satisfy: the linear functional $\mathbf{w} \cdot \alpha$ is minimized (over $\mathrm{NP}(P)$) precisely at $\sigma$.
+
+The code:
+\begin{enumerate}
+  \item Computes the Newton polytope vertices via Polymake.
+  \item Computes the normal fan (dual vertices = ray generators).
+  \item Triangulates non-simplicial cones into simplicial ones.
+  \item Returns $\{\texttt{dualVertices}, \texttt{simplexList}\}$.
+\end{enumerate}
+
+\subsection{Monomial Change of Variables}
+
+For a simplicial cone with rays $\{\rho_1, \ldots, \rho_n\}$, define:
+\begin{equation}
+M = -\mathrm{Transpose}\bigl[\rho_1, \ldots, \rho_n\bigr] \qquad (n \times n \text{ integer matrix})
+\end{equation}
+
+The change of variables is:
+\begin{equation}
+x_i = \prod_j y_j^{M_{ij}}
+\end{equation}
+
+The Jacobian is:
+\begin{equation}
+dx_1 \cdots dx_n = |\det(M)| \cdot \prod_i y_i^{(\sum_j M_{ji}) - 1} \; dy_1 \cdots dy_n
+\end{equation}
+
+The ``raw exponents'' after combining with the monomial factor are:
+\begin{equation}
+\mathrm{rawA}_j = -1 + \sum_i (A_i + 1) \cdot M_{ij}
+\end{equation}
+
+\subsection{Tropical Factoring}
+
+After the $M$-transformation, each polynomial $P_k(\mathbf{y})$ is a sum of monomials where some exponents may be negative. Define:
+\begin{equation}
+d_{k,j} = \min_m \{e_{m,j}\} \qquad \text{(min over all monomials $m$ of $P_k$)}
+\end{equation}
+
+Then:
+\begin{equation}
+P_k(\mathbf{y}) = \mathbf{y}^{d_k} \cdot Q_k(\mathbf{y})
+\end{equation}
+where $Q_k$ has all non-negative exponents and contains at least one constant term (the dominant monomial). This ensures $Q_k(\mathbf{y}) \geq \text{const} > 0$ for $\mathbf{y} \in [0,1]^n$.
+
+The effective exponents become:
+\begin{equation}
+a_{\mathrm{eff},i} = \mathrm{rawA}_i + \sum_k B_k \cdot d_{k,i}
+\end{equation}
+
+\subsection{Flattening}
+
+After tropical factoring, the integrand on $[0,\infty)^n$ has the form:
+\begin{equation}
+\prod_i y_i^{a_{\mathrm{eff},i} - 1} \cdot \prod_j Q_j(\mathbf{y})^{B_j} \cdot |\det(M)|
+\end{equation}
+
+The substitution $y_i = (y'_i)^{1/a_{\mathrm{eff},i}}$ yields:
+\begin{equation}
+y_i^{a_{\mathrm{eff},i} - 1} \, dy_i = \frac{1}{a_{\mathrm{eff},i}} \, dy'_i
+\end{equation}
+
+The $y^{a-1}$ factor is completely absorbed. The integrand becomes:
+\begin{equation}
+\frac{|\det(M)|}{\prod_i a_{\mathrm{eff},i}} \cdot \prod_j Q_j\!\bigl(\mathbf{y}'^{\,1/a_{\mathrm{eff}}}\bigr)^{B_j}
+\end{equation}
+which is $\mathcal{O}(1)$ on $[0,1]^n$, ideal for uniform Monte Carlo sampling.
+
+\subsection{Divergence Regulation (Tropical Subtraction)}
+
+When $\mathrm{Re}(a_{\mathrm{eff},k}) \leq 0$ for $\varepsilon = 0$, write $a_k(\varepsilon) = c_k \varepsilon + \mathcal{O}(\varepsilon^2)$ with $c_k > 0$. The integral over $y_k$ diverges as $1/(c_k \varepsilon)$.
+
+\paragraph{Subtraction scheme:}
+\begin{align}
+I_{\mathrm{sector}} &= \int y_k^{c_k\varepsilon - 1} \bigl[f(\mathbf{y}) - f(\mathbf{y}|_{y_k=0})\bigr] d\mathbf{y} + \int y_k^{c_k\varepsilon - 1} f(\mathbf{y}|_{y_k=0}) \, d\mathbf{y}
+\end{align}
+
+The first integral is convergent (the difference vanishes at $y_k = 0$). The second factors because $f(\mathbf{y}|_{y_k=0})$ is independent of $y_k$:
+\begin{equation}
+\int_0^1 y_k^{c_k\varepsilon - 1} dy_k = \frac{1}{c_k \varepsilon}
+\end{equation}
+
+This gives:
+\begin{align}
+\text{Pole:} & \quad \frac{G_0}{c_k \varepsilon} \\
+\text{Finite:} & \quad \frac{G_1}{c_k} \quad \text{(from $\varepsilon$-expansion, log insertions)} \\
+\text{Remainder:} & \quad R \quad \text{(convergent difference integral)}
+\end{align}
+
+\subsection{Log-Exp Polynomial Evaluation}
+
+In the C++ code, monomials with fractional or complex exponents are evaluated using:
+\begin{equation}
+c \cdot y_1^{\alpha_1} \cdots y_n^{\alpha_n} = c \cdot \exp\!\bigl(\alpha_1 \log y_1 + \cdots + \alpha_n \log y_n\bigr)
+\end{equation}
+
+This is numerically stable because:
+\begin{itemize}
+  \item For $y_i \in (0,1]$: $\log(y_i) \in (-\infty, 0]$, smooth and monotone.
+  \item As $y_i \to 0^+$: $\log(y_i) \to -\infty$, but $\exp(\cdots) \to 0$ gracefully.
+  \item No branch cuts or sign issues for real $y_i > 0$.
+  \item Works for complex $\alpha$ (the result is complex-valued).
+  \item Avoids platform-dependent behavior of \texttt{pow(y, fractional)}.
+\end{itemize}
+
+\subsection{Welford Online Variance Estimation}
+
+For each integrand function and kinematic point, Monte Carlo estimates the mean and variance using Welford's online algorithm:
+\begin{lstlisting}
+mean = 0, M2 = 0
+for k = 1, 2, ..., N:
+    v = integrand(random_point)
+    delta = v - mean
+    mean += delta / k
+    delta2 = v - mean
+    M2 += delta * delta2
+
+variance = M2 / (N - 1)
+std_error = sqrt(variance / N)
+\end{lstlisting}
+
+Properties:
+\begin{itemize}
+  \item Numerically stable (no catastrophic cancellation).
+  \item $\mathcal{O}(1)$ memory per integrand (just mean, M2, count).
+  \item Real and imaginary parts tracked independently.
+  \item Sector sums are independent: $\mathrm{Var}(\mathrm{total}) = \sum \mathrm{Var}(\mathrm{sector})$.
+\end{itemize}
+
+\subsection{IBP-Based Pole Extraction}
+
+An alternative to the tropical subtraction scheme, the IBP method resolves divergences by integration by parts.  For a divergent variable $y_k$ with $a_k = c_k\varepsilon + \mathcal{O}(\varepsilon^2)$:
+
+\paragraph{Step 1: IBP identity on $[0,1]$.}
+\begin{equation}
+\int_0^1 y_k^{a_k-1}f(\mathbf{y})\,dy_k = \frac{1}{a_k}\bigl[f\big|_{y_k=1} - \int_0^1 y_k^{a_k}\partial_{y_k}f\,dy_k\bigr]
+\end{equation}
+
+\paragraph{Step 2: Monomial decomposition of derivative.}
+$\partial_{y_k}Q_j = \sum_{m:\,e_{m,k}>0} c_m\,e_{m,k}\,y_k^{e_{m,k}-1}\prod_{i\neq k}y_i^{e_{m,i}}$.
+Each monomial generates a separate integral term with:
+\begin{itemize}
+\item Coefficient: $B_j \cdot c_m \cdot e_{m,k}$
+\item New exponents: $\alpha_{t,k} = a_k + e_{m,k}$ (convergent since $e_{m,k}\geq 1$), $\alpha_{t,i} = a_i + e_{m,i}$ for $i\neq k$
+\item Polynomial factors: $Q_j^{B_j-1}\prod_{l\neq j}Q_l^{B_l}$
+\end{itemize}
+
+\paragraph{Step 3: $\varepsilon$-expansion before flattening.}
+Each term's exponents $\alpha_{t,i}(\varepsilon)$ and polynomial exponents $\tilde{B}_j(\varepsilon)$ are expanded in $\varepsilon$.  At order $\varepsilon^0$: the base integrand (no log insertions).  At order $\varepsilon^1$: the base integrand times log-insertion sum $\sum_i(\alpha_{t,i}^{(1)}/\alpha_{t,i}^{(0)})\log y_i' + \sum_j\tilde{B}_j^{(1)}\log Q_j$.
+
+\paragraph{Step 4: Per-term flattening.}
+Each term gets its own flattening $y_i \to (y_i')^{1/\alpha_{t,i}^{(0)}}$ since different terms have different zeroth-order exponents.
+
+\paragraph{Step 5: Iterative application for nested divergences.}
+When multiple variables are divergent, apply IBP iteratively.  After resolving $y_{k_1}$, check each resulting term for remaining divergences and apply IBP to $y_{k_2}$ as needed.  With $d$ nested divergences, poles up to $1/\varepsilon^d$ are produced.
+
+\subsection{Treatment of Complex Exponents}\label{sec:complex-exponents}
+
+The exponents $A_i$ (monomial) and $B_j$ (polynomial) may be complex-valued.
+The pipeline handles this by cleanly separating the combinatorial steps---which
+depend only on real integer data---from the analytic steps, which carry the full
+complex values throughout.
+
+\paragraph{What is real/combinatorial.}
+The following operations depend only on the Newton polytope (the set of
+exponent vectors appearing in the polynomials) and are therefore insensitive
+to the complex parts of $A_i$ and $B_j$:
+\begin{itemize}
+  \item Newton polytope construction and convex hull computation.
+  \item Normal fan and simplicial triangulation (ray vectors $\rho_i$ are integer).
+  \item The ray matrix $M = -\mathrm{Transpose}[\rho_1, \ldots, \rho_n]$ and its determinant.
+  \item Tropical factoring: the minimum exponents $d_{k,j} = \min_m\{e_{m,j}\}$ are determined by the transformed polynomial exponent vectors, which are integer linear combinations of the original (integer) exponent vectors. These do not depend on $A_i$ or $B_j$ at all.
+\end{itemize}
+
+\paragraph{What is complex.}
+The following quantities use the full complex values of $A_i$ and $B_j$, and
+are computed symbolically in Mathematica before being passed to C++:
+\begin{itemize}
+  \item \textbf{Effective exponents} (line~227 of \texttt{tropical\_eval.wl}):
+    \begin{equation}
+    a_{\mathrm{eff},i} = \mathrm{rawA}_i + \sum_k B_k \cdot d_{k,i} \;\in\; \mathbb{C}
+    \end{equation}
+    Here $\mathrm{rawA}_i = -1 + \sum_k (A_k + 1) M_{ki}$, which is complex when the $A_k$ are.
+    The $B_k$ contribute their complex parts through the $B_k \cdot d_{k,i}$ term.
+
+  \item \textbf{Flattening} (line~286): the exponent division $e_{m,i} / a_{\mathrm{eff},i}$
+    uses the full complex $a_{\mathrm{eff},i}$, producing complex-valued flattened exponents.
+    In the C++ code these appear inside the log-exp evaluation:
+    \begin{equation}
+    y_i^{e/a_{\mathrm{eff},i}} = \exp\!\bigl((e/a_{\mathrm{eff},i}) \cdot \log y_i\bigr)
+    \end{equation}
+    which is well-defined for $y_i \in (0,1]$ and complex exponent ratio.
+
+  \item \textbf{Prefactor} (line~293):
+    \begin{equation}
+    \mathrm{prefactor} = \frac{|\det(M)|}{\prod_i a_{\mathrm{eff},i}} \;\in\; \mathbb{C}
+    \end{equation}
+
+  \item \textbf{Convergence check} (line~246): only $\mathrm{Re}(a_{\mathrm{eff},i})$ is tested.
+    A sector is convergent if and only if $\mathrm{Re}(a_{\mathrm{eff},i}) > 0$ for all~$i$
+    (at $\varepsilon = 0$ when a regulator is present). The imaginary part does not affect convergence.
+
+  \item \textbf{Divergent sector processing}: In \texttt{ProcessDivergentSector}, the
+    $G_0$ flattening (line~680) divides by $a_0[\texttt{ndVars}]$ (the $\varepsilon = 0$
+    evaluation of the full complex effective exponents), and the remainder
+    flattening (line~719) divides by $a_0[i]$. Both carry complex values.
+\end{itemize}
+
+\paragraph{Summary.}
+The computational strategy is:
+\begin{enumerate}
+  \item Perform the tropical decomposition using only the combinatorial
+        structure of the polynomials (integer exponent vectors). This is
+        purely real.
+  \item Compute $a_{\mathrm{eff},i}$ and the flattening transform using the full complex
+        $A_i$ and $B_j$. All downstream quantities (flattened exponents,
+        prefactors, C++ integrands) are complex-valued.
+  \item In C++, all arithmetic is \texttt{std::complex<double>}. The log-exp
+        evaluation $\exp(\alpha \log y)$ with complex $\alpha$ and real $y > 0$
+        is numerically stable and branch-cut free.
+\end{enumerate}
+
+%=============================================================================
+\section{Dependencies}
+%=============================================================================
+
+\subsection{External Software}
+
+\begin{description}
+  \item[Polymake] (\url{https://polymake.org}) \\
+    C++ library with Perl interface for polyhedral computation. Used for convex hulls, vertex enumeration, fan computation, and simplicial triangulation. Must be installed and accessible on \texttt{PATH}, or in one of: \texttt{/opt/homebrew}, \texttt{/usr/local}, \texttt{/usr}.
+
+  \item[g++ (GCC C++ compiler)] ~\\
+    C++17 standard required (\texttt{-std=c++17}). OpenMP support recommended (\texttt{-fopenmp}) for parallel kinematic evaluation. If OpenMP linking fails (common on macOS with clang), the code auto-retries without \texttt{-fopenmp}.
+
+  \item[Wolfram Mathematica (version 12.0+)] ~\\
+    The symbolic computation engine. Required for running all \texttt{.wl} files. \texttt{wolframscript} used for command-line execution.
+\end{description}
+
+\subsection{Internal Dependencies}
+
+\begin{itemize}
+  \item \texttt{tropical\_fan.wl} must be loaded before \texttt{tropical\_eval.wl} (the latter calls \texttt{Get["tropical\_fan.wl"]} internally).
+  \item No external Wolfram packages required beyond the core installation.
+\end{itemize}
+
+%=============================================================================
+\section{Usage and Workflow}
+%=============================================================================
+
+\subsection{Minimal Convergent Integral}
+
+\begin{lstlisting}[language=Mathematica]
+(* Load the package *)
+Get["tropical_eval.wl"];
+
+(* Define the integrand *)
+poly = 1 + 2*x[1]^2 + x[2]^2 + x[1]*x[2]^2;
+vars = {x[1], x[2]};
+
+spec = <|
+  "Polynomials"         -> {poly},
+  "MonomialExponents"   -> {0, 0},
+  "PolynomialExponents" -> {-2},
+  "Variables"           -> vars,
+  "KinematicSymbols"    -> {},
+  "RegulatorSymbol"     -> None
+|>;
+
+(* Compute the fan *)
+verts   = PolytopeVertices[poly^(-1), vars];
+fanData = ComputeDecomposition[verts];
+
+(* Validate against NIntegrate *)
+vr = ValidateDecomposition[spec, fanData, {}, 3];
+Print["Relative error: ", vr["RelativeError"]];
+
+(* Full MC evaluation *)
+results = EvaluateTropicalMC[spec, fanData, {}];
+\end{lstlisting}
+
+\subsection{Kinematic Scan (Many Evaluation Points)}
+
+\begin{lstlisting}[language=Mathematica]
+Get["tropical_eval.wl"];
+
+(* Polynomial with kinematic-dependent coefficients *)
+poly = c0 + c1*x[1]^2 + c2*x[2]^2;
+
+spec = <|
+  "Polynomials"         -> {poly},
+  "MonomialExponents"   -> {0, 0},
+  "PolynomialExponents" -> {-2},
+  "Variables"           -> {x[1], x[2]},
+  "KinematicSymbols"    -> {c0, c1, c2},
+  "RegulatorSymbol"     -> None
+|>;
+
+(* Fan uses unit coefficients -- structure only *)
+proxyPoly = 1 + x[1]^2 + x[2]^2;
+verts = PolytopeVertices[proxyPoly^(-1), vars];
+fanData = ComputeDecomposition[verts];
+
+(* Define 7200 kinematic points *)
+kinPoints = Table[{1.0, 0.5+0.01*i, 1.0+0.005*i}, {i, 7200}];
+
+(* Evaluate: one compilation, parallel execution *)
+results = EvaluateTropicalMC[spec, fanData, kinPoints];
+\end{lstlisting}
+
+\textbf{Note:} The fan decomposition depends only on the Newton polytope structure (which monomials appear), not on numerical coefficients. The same decomposition works for all kinematic points, requiring only one C++ compilation.
+
+\subsection{Divergent Integral with Regulator}
+
+\begin{lstlisting}[language=Mathematica]
+Get["tropical_eval.wl"];
+
+spec = <|
+  "Polynomials"         -> {1 + x[1] + x[2] + x[1]*x[2]},
+  "MonomialExponents"   -> {2*eps - 1, 0},
+  "PolynomialExponents" -> {-2},
+  "Variables"           -> {x[1], x[2]},
+  "KinematicSymbols"    -> {},
+  "RegulatorSymbol"     -> eps
+|>;
+
+verts = PolytopeVertices[
+  (1 + x[1] + x[2] + x[1]*x[2])^(-1), {x[1], x[2]}];
+fanData = ComputeDecomposition[verts];
+
+(* Evaluate at eps = 0.01 *)
+results = EvaluateTropicalMC[spec, fanData, {},
+  EpsilonValue -> 0.01];
+\end{lstlisting}
+
+The result includes: analytic pole coefficient/$\varepsilon$, numerical finite part ($G_1/c_k +$ Remainder), and total with error bars.
+
+\subsection{Command-Line Execution}
+
+\begin{lstlisting}[language=bash]
+# Quick smoke test (Example 1 only)
+wolframscript -file EXAMPLES/test_quick.wl
+
+# C++ code generation and execution test
+wolframscript -file EXAMPLES/test_cpp.wl
+
+# Divergent integral tests
+wolframscript -file EXAMPLES/test_divergent.wl
+
+# Full example suite (14 examples + 18 tests)
+wolframscript -file EXAMPLES/tropical_eval_examples.wl
+
+# Fan computation examples
+wolframscript -file EXAMPLES/tropical_fan_examples.wl
+\end{lstlisting}
+
+%=============================================================================
+\section{Examples Directory}
+%=============================================================================
+
+The \texttt{EXAMPLES/} directory contains worked examples and validation tests.
+
+\subsection*{\texttt{tropical\_eval\_examples.wl} --- 14 Worked Examples}
+
+\begin{center}
+\begin{tabular}{cl}
+\toprule
+\textbf{Example} & \textbf{Description} \\
+\midrule
+1 & Basic 2D convergent integral \\
+2 & Complex exponents ($A_i$ and $B_j$ with imaginary parts) \\
+3 & Kinematic-dependent integral (coefficients are parameters) \\
+4 & Tropical factoring step-by-step walkthrough \\
+5 & \texttt{MmaToC} expression converter demonstration \\
+6 & C++ code generation and execution (full pipeline) \\
+7 & C++ with kinematic scan (multiple evaluation points) \\
+8 & \texttt{ParsePolynomial} utility function \\
+9 & Multiple polynomials (2 factors in denominator) \\
+10 & Non-trivial numerator (1 polynomial, $A_i \neq 0$) \\
+11 & Non-trivial numerator (2 polynomials) \\
+12 & Numerator with kinematic-dependent coefficients \\
+13 & 3D convergent integral (6 rays, 8 sectors) \\
+14 & 4D convergent integral (8 rays, 14 sectors) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection*{Other Example Files}
+
+\begin{description}
+  \item[\texttt{tropical\_fan\_examples.wl}] --- Fan decomposition examples for various polytopes.
+  \item[\texttt{test\_quick.wl}] --- Minimal test running only Example~1.
+  \item[\texttt{test\_cpp.wl}] --- Tests C++ code generation, compilation, and execution.
+  \item[\texttt{test\_divergent.wl}] --- Tests the divergence regulation pipeline.
+  \item[\texttt{prompt\_tropical\_mc.txt}] --- Original development specification.
+\end{description}
+
+%=============================================================================
+\section{Validation and Testing}
+%=============================================================================
+
+\subsection{22-Test Suite (in \texttt{tropical\_eval\_examples.wl})}
+
+\subsubsection*{Convergent Tests (1--7)}
+
+\begin{description}
+  \item[Test 1:] 2D real exponents. Benchmarked against exact result via polynomial transformation.
+  \item[Test 2:] 2D complex exponents. Cross-checked against \texttt{NIntegrate}.
+  \item[Test 3:] 1D divergent (pole extraction). Verifies analytic pole coefficient.
+  \item[Test 4:] 2D divergent. Checks $G_0$, $G_1$, and Remainder separation.
+  \item[Test 5:] 100-point kinematic scan with complex exponents.
+  \item[Test 6:] Large coefficient range ($10^{-4}$ to $10^8$).
+  \item[Test 7:] 3D and 4D integrals. 3D: 6 rays, 8 sectors; 4D: 8 rays, 14 sectors.
+\end{description}
+
+\subsubsection*{Divergent Tests (8--18)}
+
+\begin{description}
+  \item[Test 8:] Full divergent pipeline (\texttt{ProcessSector} $\to$ \texttt{ProcessDivergentSector} $\to$ \texttt{ValidateSubtraction}).
+  \item[Test 9:] Multi-$\varepsilon$ convergence.
+  \item[Test 10:] Divergent variable permutation (not always $y_1$).
+  \item[Test 11:] $\varepsilon$-dependent polynomial exponents ($B_j = B_j(\varepsilon)$).
+  \item[Test 12:] Full sector sum (convergent + divergent).
+  \item[Test 13:] C++ codegen for divergent sectors.
+  \item[Test 14:] Pole coefficient accuracy (analytic vs.\ numerical).
+  \item[Test 15:] $G_1$ log-insertion structural check.
+  \item[Test 16:] Multiple-polynomial divergent.
+  \item[Test 17:] 3D divergent integral.
+  \item[Test 18:] Complex polynomial exponents with $1/\varepsilon$ pole.
+\end{description}
+
+\subsubsection*{IBP Tests (19--22)}
+
+\begin{description}
+  \item[Test 19:] IBP symbolic decomposition.  Verifies \texttt{IBPReduceSector} produces the correct number of terms (matching the count of monomials with $e_{m,k}>0$) and that all terms have convergent exponents at $\varepsilon=0$.
+  \item[Test 20:] IBP cross-check via \texttt{ValidateIBP}.  Verifies that $(1/a_k)[B_{\mathrm{boundary}} - \sum_t \mathrm{coeff}_t I_t]$ reproduces the original sector integral at finite $\varepsilon$ (threshold: 5\%).
+  \item[Test 21:] IBP term count with multi-monomial polynomial (5 monomials).  Verifies term count matches per sector.
+  \item[Test 22:] Nested divergence (two divergent variables).  Constructs a 2D integral with both $x_1$ and $x_2$ divergent ($A_i = 2\varepsilon - 1$ for both).  Verifies iterative IBP resolves all divergences: $1\to 2\to 3$ terms.
+\end{description}
+
+\subsection{FIESTA Cross-Checks (\texttt{CC/} Directory)}
+
+The \texttt{CC/} directory contains cross-validation against \textbf{FIESTA}, an independent sector decomposition code used in the physics community.
+
+\begin{description}
+  \item[Simple tests:] $\pi/8$ integral (convergent, agreement to 6 decimal places), Gamma function integral (divergent, pole matches exactly), 2D with kinematics.
+
+  \item[Full 5D cosmological integral (bubblepp presector 1):]~
+    \begin{itemize}
+      \item 36 convergent sectors + 14 divergent sectors
+      \item All divergent sectors have $c_k = 2/7$
+      \item Convergence study: $N = 50{,}000$ to $10{,}000{,}000$ samples
+      \item Error scales as $1/\sqrt{N}$
+      \item Results match FIESTA to within $2\sigma$ of MC error
+      \item Verified via GL(1)/Cheng--Wu gauge transformation
+    \end{itemize}
+\end{description}
+
+%=============================================================================
+\section{Limitations and Caveats}
+%=============================================================================
+
+\begin{enumerate}
+  \item \textbf{Divergence handling.} The tropical subtraction scheme (\texttt{ProcessDivergentSector}) handles at most one divergent variable per sector.  For nested divergences (multiple divergent variables), use the IBP-based pipeline (\texttt{IBPProcessSector} / \texttt{EvaluateTropicalMCIBP}), which handles arbitrary nesting depth.  The number of IBP terms grows combinatorially with the nesting depth ($\mathcal{O}(M^d)$ for $d$ divergent variables and $M$ total monomials).
+
+  \item \textbf{Positive real polynomial coefficients.} All polynomial coefficients must be real and positive, ensuring $\log(P_j)$ is real-valued. Complex integrands arise only from the exponents $A_i$ and $B_j$.
+
+  \item \textbf{Monte Carlo convergence.} Accuracy scales as $1/\sqrt{N}$. High-variance sectors may require $> 10^6$ samples.
+
+  \item \textbf{Polymake dependency.} External tool, not bundled. Must be installed separately.
+
+  \item \textbf{Newton polytope stability.} If kinematic parameters can cause coefficients to vanish, the Newton polytope changes and the fan must be recomputed. The code assumes fixed polytope structure across all kinematic points.
+
+  \item \textbf{C++ compiler requirements.} \texttt{g++} with C++17 required. OpenMP optional but recommended. macOS clang may require fallback to single-threaded mode.
+
+  \item \textbf{Double precision.} All C++ computation uses 64-bit doubles. Higher precision would require additional libraries.
+
+  \item \textbf{Memory scaling.} Results scale linearly with the number of kinematic points. Very large scans ($\gg 10{,}000$ points) may require attention to memory.
+\end{enumerate}
+
+%=============================================================================
+\section{Mathematical Properties and Why It Works}
+%=============================================================================
+
+\paragraph{Why tropical decomposition works.}
+As $\mathbf{x} \to 0$ in a direction $\mathbf{w}$, the polynomial $P(\mathbf{x})$ is dominated by the monomial whose exponent vector minimizes the dot product with $\mathbf{w}$. The tropical fan exactly partitions $\mathbb{R}^n$ into regions where each monomial dominates. Within each sector, the dominant monomial is factored out, leaving a polynomial $Q(\mathbf{y})$ bounded away from zero.
+
+\paragraph{Why flattening is important.}
+Without flattening, the integrand contains factors $y_i^{a_i - 1}$ which can be highly peaked near $y_i = 0$ when $a_i$ is small. Uniform MC sampling wastes most samples away from the peak, leading to enormous variance. Flattening absorbs the $y^{a-1}$ singularity into the integration measure, converting the integrand to $\mathcal{O}(1)$ and dramatically reducing MC variance.
+
+\paragraph{Why log-exp evaluation is stable.}
+For $y \in (0, 1]$, $\log(y)$ varies smoothly in $(-\infty, 0]$. The exponential $\exp(\alpha \log y) = y^\alpha$ handles fractional and complex $\alpha$ without branch cuts or sign ambiguities. As $y \to 0^+$, the function decays or grows depending on $\mathrm{Re}(\alpha)$, but always smoothly.
+
+\paragraph{Why tropical factoring is exact.}
+The identity $P(\mathbf{y}) = \mathbf{y}^d \cdot Q(\mathbf{y})$ is algebraic, not a numerical approximation. Every monomial in $Q$ has non-negative exponents by construction. The constant term in $Q$ ensures $Q \geq \text{const} > 0$ on $[0,1]^n$. No numerical error is introduced.
+
+\paragraph{Why the pole extraction is correct.}
+The $1/(c_k \varepsilon)$ pole arises from:
+\begin{equation}
+\int_0^1 y_k^{c_k \varepsilon - 1} \, dy_k = \frac{1}{c_k \varepsilon}
+\end{equation}
+This is exact. The subtraction $f(\mathbf{y}) - f(\mathbf{y}|_{y_k=0})$ vanishes at $y_k = 0$, so the difference integral is convergent for $\varepsilon = 0$. The $G_1$ correction captures the $\mathcal{O}(\varepsilon^0)$ contribution from the $\varepsilon$-expansion. Together, these give the complete Laurent expansion to order $\mathcal{O}(\varepsilon^0)$.
+
+\paragraph{Why the IBP pole extraction is correct.}
+The IBP identity on $[0,1]$ gives:
+\begin{equation}
+a_k \int_0^1 y_k^{a_k-1}f\,dy_k = f\big|_{y_k=1} - \int_0^1 y_k^{a_k}\partial_{y_k}f\,dy_k
+\end{equation}
+The boundary at $y_k=0$ vanishes for $\mathrm{Re}(a_k)>0$ (i.e., for $\varepsilon>0$). The boundary at $y_k=1$ is a well-defined $(n{-}1)$-dimensional integral.  Dividing by $a_k = c_k\varepsilon + \cdots$ produces the $1/\varepsilon$ pole.
+
+Each IBP term has effective exponent $\alpha_{t,k}^{(0)} = e_{m,k} \geq 1$ for the previously-divergent variable, ensuring convergence.  The monomial decomposition avoids introducing $(\partial_{y_k}Q_j)/Q_j$ ratios in the C++ integrands---each term evaluates only standard polynomial-power expressions.
+
+For nested divergences, successive IBP steps produce higher-order poles $1/\varepsilon^d$.  The identity $B^{(0)} - \sum_t \mathrm{coeff}_t^{(0)} I_{t,0} = G_0$ connects the IBP result to the subtraction scheme's pole coefficient, providing a cross-check.
+
+\end{document}

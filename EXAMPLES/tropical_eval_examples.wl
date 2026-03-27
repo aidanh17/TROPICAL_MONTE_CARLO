@@ -2755,3 +2755,375 @@ RunTest18[] := Module[
   Print["  ", If[allPass, "PASS", "FAIL"]];
   allPass
 ];
+
+
+(* ============================================================================
+   IBP REGRESSION TESTS
+
+   Test 19: IBPReduceSector symbolic decomposition (2D, single divergence)
+   Test 20: IBP cross-check against direct NIntegrate (ValidateIBP)
+   Test 21: IBP term count sanity check (multi-monomial polynomial)
+   Test 22: Nested divergence test (2D, two divergent variables)
+   ============================================================================ *)
+
+(* --------------------------------------------------------------------------
+   Test 19: IBPReduceSector symbolic decomposition
+   Verifies IBP produces correct term count and all terms are convergent.
+   -------------------------------------------------------------------------- *)
+
+RunTest19[] := Module[
+  {poly, vars, eps, spec, verts, fanData,
+   dualVertices, simplexList,
+   allSectorData, divSectors,
+   allPass},
+
+  Print["--- Test 19: IBP symbolic decomposition (2D) ---"];
+  Print["Int x1^{2eps-1} (1+x1+x2+x1*x2)^{-2} dx"];
+
+  eps  = Symbol["eps19"];
+  poly = 1 + x[1] + x[2] + x[1] x[2];
+  vars = {x[1], x[2]};
+
+  spec = <|
+    "Polynomials"        -> {poly},
+    "MonomialExponents"  -> {2 eps - 1, 0},
+    "PolynomialExponents" -> {-2},
+    "Variables"          -> vars,
+    "KinematicSymbols"   -> {},
+    "RegulatorSymbol"    -> eps
+  |>;
+
+  verts   = PolytopeVertices[poly^(-2), vars];
+  fanData = ComputeDecomposition[verts, "ShowProgress" -> False];
+  dualVertices = fanData[[1]];
+  simplexList  = fanData[[2]];
+
+  allSectorData = Table[
+    Quiet@ProcessSector[spec, dualVertices, simplexList[[i]], i],
+    {i, Length[simplexList]}
+  ];
+
+  divSectors = Select[allSectorData,
+    (AssociationQ[#] && #["IsDivergent"]) &];
+
+  If[Length[divSectors] == 0,
+    Print["  No divergent sectors found, FAIL"];
+    Return[False]
+  ];
+  Print["  Found ", Length[divSectors], " divergent sector(s)"];
+
+  allPass = True;
+  Do[
+    Module[{ibpData, terms, nTerms, k},
+      ibpData = Quiet@IBPReduceSector[sd, eps];
+      If[!AssociationQ[ibpData],
+        Print["  IBPReduceSector failed for sector ", sd["ConeIndex"]];
+        allPass = False;,
+
+        terms  = ibpData["Terms"];
+        nTerms = ibpData["NTerms"];
+        k      = ibpData["DivergentVariables"][[1]];
+
+        Print["  Sector ", sd["ConeIndex"], ": y_", k, " divergent, ",
+              nTerms, " IBP terms"];
+
+        (* Check term count: should equal number of monomials with e_{m,k} > 0 *)
+        Module[{expectedCount, clearedPolys},
+          clearedPolys = sd["ClearedPolys"];
+          expectedCount = Total[Table[
+            Count[clearedPolys[[j]],
+              _?(TrueQ[#[[2, k]] > 0] ||
+                 (NumericQ[#[[2, k]]] && #[[2, k]] > 0) &)],
+            {j, Length[clearedPolys]}
+          ]];
+          Print["    Expected terms: ", expectedCount, ", got: ", nTerms];
+          If[nTerms != expectedCount,
+            Print["    FAIL: term count mismatch"];
+            allPass = False;
+          ];
+        ];
+
+        (* Check all terms convergent at eps=0 *)
+        Do[
+          Module[{termA0},
+            termA0 = terms[[t]]["NewExponents"] /. eps -> 0;
+            Do[
+              If[(NumericQ[termA0[[i]]] && Re[termA0[[i]]] <= 0) ||
+                 TrueQ[Re[termA0[[i]]] <= 0],
+                Print["    FAIL: term ", t, " divergent in y_", i,
+                      ", alpha0 = ", termA0[[i]]];
+                allPass = False;
+              ],
+              {i, ibpData["Dimension"]}
+            ]
+          ],
+          {t, nTerms}
+        ];
+      ];
+    ],
+    {sd, divSectors}
+  ];
+
+  Print["  ", If[allPass, "PASS", "FAIL"]];
+  allPass
+];
+
+(* --------------------------------------------------------------------------
+   Test 20: IBP cross-check against direct NIntegrate
+   Uses ValidateIBP to verify: (1/a_k)[B - sum_t coeff_t I_t] = original
+   -------------------------------------------------------------------------- *)
+
+RunTest20[] := Module[
+  {poly, vars, eps, spec, verts, fanData,
+   dualVertices, simplexList,
+   allSectorData, divSectors,
+   allPass},
+
+  Print["--- Test 20: IBP cross-check via ValidateIBP (2D) ---"];
+  Print["Int x1^{2eps-1} (1+x1+x2+x1*x2)^{-2} dx"];
+
+  eps  = Symbol["eps20"];
+  poly = 1 + x[1] + x[2] + x[1] x[2];
+  vars = {x[1], x[2]};
+
+  spec = <|
+    "Polynomials"        -> {poly},
+    "MonomialExponents"  -> {2 eps - 1, 0},
+    "PolynomialExponents" -> {-2},
+    "Variables"          -> vars,
+    "KinematicSymbols"   -> {},
+    "RegulatorSymbol"    -> eps
+  |>;
+
+  verts   = PolytopeVertices[poly^(-2), vars];
+  fanData = ComputeDecomposition[verts, "ShowProgress" -> False];
+  dualVertices = fanData[[1]];
+  simplexList  = fanData[[2]];
+
+  allSectorData = Table[
+    Quiet@ProcessSector[spec, dualVertices, simplexList[[i]], i],
+    {i, Length[simplexList]}
+  ];
+
+  divSectors = Select[allSectorData,
+    (AssociationQ[#] && #["IsDivergent"]) &];
+
+  If[Length[divSectors] == 0,
+    Print["  No divergent sectors found, FAIL"];
+    Return[False]
+  ];
+
+  allPass = True;
+  Do[
+    Module[{ibpSD, vResult, relErr},
+      ibpSD = Quiet@IBPProcessSector[sd, spec];
+      If[!AssociationQ[ibpSD],
+        Print["  IBPProcessSector failed for sector ", sd["ConeIndex"]];
+        allPass = False;,
+
+        vResult = Quiet@ValidateIBP[ibpSD, sd, spec, {}, 0.01];
+        If[!AssociationQ[vResult],
+          Print["  ValidateIBP failed for sector ", sd["ConeIndex"]];
+          allPass = False;,
+
+          relErr = vResult["RelativeError"];
+          Print["  Sector ", sd["ConeIndex"], ": RelativeError = ", relErr];
+          If[!NumericQ[relErr] || relErr > 0.05,
+            Print["    FAIL (threshold: 0.05)"];
+            allPass = False;,
+            Print["    PASS"];
+          ];
+        ];
+      ];
+    ],
+    {sd, divSectors}
+  ];
+
+  Print["  ", If[allPass, "PASS", "FAIL"]];
+  allPass
+];
+
+(* --------------------------------------------------------------------------
+   Test 21: IBP term count with multi-monomial polynomial
+   -------------------------------------------------------------------------- *)
+
+RunTest21[] := Module[
+  {poly, vars, eps, spec, verts, fanData,
+   dualVertices, simplexList,
+   allSectorData, divSectors,
+   allPass},
+
+  Print["--- Test 21: IBP term count for multi-monomial polynomial ---"];
+  Print["Int x1^{2eps-1} (1+x1+x2+x1*x2+x1^2*x2)^{-2} dx"];
+
+  eps  = Symbol["eps21"];
+  poly = 1 + x[1] + x[2] + x[1] x[2] + x[1]^2 x[2];
+  vars = {x[1], x[2]};
+
+  spec = <|
+    "Polynomials"        -> {poly},
+    "MonomialExponents"  -> {2 eps - 1, 0},
+    "PolynomialExponents" -> {-2},
+    "Variables"          -> vars,
+    "KinematicSymbols"   -> {},
+    "RegulatorSymbol"    -> eps
+  |>;
+
+  verts   = PolytopeVertices[poly^(-2), vars];
+  fanData = ComputeDecomposition[verts, "ShowProgress" -> False];
+  dualVertices = fanData[[1]];
+  simplexList  = fanData[[2]];
+
+  allSectorData = Table[
+    Quiet@ProcessSector[spec, dualVertices, simplexList[[i]], i],
+    {i, Length[simplexList]}
+  ];
+
+  divSectors = Select[allSectorData,
+    (AssociationQ[#] && #["IsDivergent"]) &];
+
+  If[Length[divSectors] == 0,
+    Print["  No divergent sectors found, FAIL"];
+    Return[False]
+  ];
+
+  allPass = True;
+  Do[
+    Module[{ibpData, nTerms, k, clearedPolys, expectedCount},
+      ibpData = Quiet@IBPReduceSector[sd, eps];
+      If[!AssociationQ[ibpData],
+        Print["  IBPReduceSector failed, FAIL"];
+        allPass = False;,
+
+        nTerms       = ibpData["NTerms"];
+        k            = ibpData["DivergentVariables"][[1]];
+        clearedPolys = sd["ClearedPolys"];
+        expectedCount = Total[Table[
+          Count[clearedPolys[[j]],
+            _?(TrueQ[#[[2, k]] > 0] ||
+               (NumericQ[#[[2, k]]] && #[[2, k]] > 0) &)],
+          {j, Length[clearedPolys]}
+        ]];
+
+        Print["  Sector ", sd["ConeIndex"], ": ", nTerms, " terms",
+              " (expected ", expectedCount, ")"];
+        If[nTerms != expectedCount,
+          Print["    FAIL: mismatch"];
+          allPass = False;,
+          Print["    PASS"];
+        ];
+      ];
+    ],
+    {sd, divSectors}
+  ];
+
+  Print["  ", If[allPass, "PASS", "FAIL"]];
+  allPass
+];
+
+(* --------------------------------------------------------------------------
+   Test 22: Nested divergence (two divergent variables)
+   Constructs a synthetic test with two divergent variables in a sector.
+   Verifies IBP resolves both and all resulting terms are convergent.
+   -------------------------------------------------------------------------- *)
+
+RunTest22[] := Module[
+  {poly, vars, eps, spec, verts, fanData,
+   dualVertices, simplexList,
+   allSectorData, divSectors,
+   allPass},
+
+  Print["--- Test 22: Nested divergence (two divergent variables) ---"];
+  Print["Int x1^{2eps-1} x2^{2eps-1} (1+x1+x2+x1*x2)^{-3} dx"];
+
+  eps  = Symbol["eps22"];
+  poly = 1 + x[1] + x[2] + x[1] x[2];
+  vars = {x[1], x[2]};
+
+  spec = <|
+    "Polynomials"        -> {poly},
+    "MonomialExponents"  -> {2 eps - 1, 2 eps - 1},
+    "PolynomialExponents" -> {-3},
+    "Variables"          -> vars,
+    "KinematicSymbols"   -> {},
+    "RegulatorSymbol"    -> eps
+  |>;
+
+  verts   = PolytopeVertices[poly^(-3), vars];
+  fanData = ComputeDecomposition[verts, "ShowProgress" -> False];
+  dualVertices = fanData[[1]];
+  simplexList  = fanData[[2]];
+
+  allSectorData = Table[
+    Quiet@ProcessSector[spec, dualVertices, simplexList[[i]], i],
+    {i, Length[simplexList]}
+  ];
+
+  divSectors = Select[allSectorData,
+    (AssociationQ[#] && #["IsDivergent"]) &];
+
+  If[Length[divSectors] == 0,
+    Print["  No divergent sectors found, FAIL"];
+    Return[False]
+  ];
+
+  (* Report on multi-divergent sectors *)
+  Module[{multiDivSectors},
+    multiDivSectors = Select[divSectors, Function[sd,
+      Module[{a0, n, cnt},
+        n  = sd["Dimension"];
+        a0 = sd["NewExponents"] /. eps -> 0;
+        cnt = Count[Range[n],
+          _?(TrueQ[Re[a0[[#]]] <= 0] ||
+             (NumericQ[a0[[#]]] && Re[a0[[#]]] <= 0) &)
+        ];
+        cnt > 1
+      ]
+    ]];
+    Print["  Found ", Length[divSectors], " divergent sectors, ",
+          Length[multiDivSectors], " with nested divergences"];
+  ];
+
+  allPass = True;
+  Do[
+    Module[{ibpData, nTerms, divVars},
+      ibpData = Quiet@IBPReduceSector[sd, eps];
+      If[!AssociationQ[ibpData],
+        Print["  IBPReduceSector failed for sector ", sd["ConeIndex"]];
+        allPass = False;,
+
+        nTerms  = ibpData["NTerms"];
+        divVars = ibpData["DivergentVariables"];
+        Print["  Sector ", sd["ConeIndex"], ": ",
+              Length[divVars], " div var(s), ",
+              nTerms, " IBP terms"];
+
+        (* Verify all terms convergent *)
+        Module[{badCount = 0},
+          Do[
+            Module[{termA0},
+              termA0 = ibpData["Terms"][[t]]["NewExponents"] /. eps -> 0;
+              Do[
+                If[(NumericQ[termA0[[i]]] && Re[termA0[[i]]] <= 0) ||
+                   TrueQ[Re[termA0[[i]]] <= 0],
+                  badCount++;
+                ],
+                {i, ibpData["Dimension"]}
+              ]
+            ],
+            {t, nTerms}
+          ];
+          If[badCount > 0,
+            Print["    FAIL: ", badCount, " remaining divergences"];
+            allPass = False;,
+            Print["    PASS: all terms convergent"];
+          ];
+        ];
+      ];
+    ],
+    {sd, divSectors}
+  ];
+
+  Print["  ", If[allPass, "PASS", "FAIL"]];
+  allPass
+];
