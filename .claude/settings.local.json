@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /home/aidanh/Desktop/GitHubRepos/TROPICAL_MONTE_CARLO -not -path */.git* -type f)",
+      "Bash(pdflatex --version)",
+      "Bash(pdflatex -interaction=nonstopmode manual.tex)",
+      "Bash(wolframscript:*)",
+      "WebSearch",
+      "WebFetch(domain:leanprover-community.github.io)",
+      "Bash(wc -l /home/aidanh/Desktop/GitHubRepos/TROPICAL_MONTE_CARLO/lean_verification/README.md /home/aidanh/Desktop/GitHubRepos/TROPICAL_MONTE_CARLO/lean_verification/phase*.md /home/aidanh/Desktop/GitHubRepos/TROPICAL_MONTE_CARLO/lean_verification/TropicalMC/TropicalMC/*.lean /home/aidanh/Desktop/GitHubRepos/TROPICAL_MONTE_CARLO/lean_verification/TropicalMC/*.lean)",
+      "Bash(grep -c \"sorry\" /home/aidanh/Desktop/GitHubRepos/TROPICAL_MONTE_CARLO/lean_verification/TropicalMC/TropicalMC/Phase*.lean)",
+      "Bash(chmod:*)",
+      "Bash(elan show:*)",
+      "Bash(lake --version)"
+    ]
+  }
+}
